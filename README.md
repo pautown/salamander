@@ -64,7 +64,7 @@ Default CarThing connection:
 - Host: `172.16.42.2`
 - User: `root`
 - Password: `llizardos`
-- Plugin path: `/tmp/plugins`
+- Plugin path: `/usr/lib/llizard/plugins`
 
 ## File Structure
 

@@ -11,7 +11,7 @@
 #define SSH_DEFAULT_HOST "172.16.42.2"
 #define SSH_DEFAULT_USER "root"
 #define SSH_DEFAULT_PASS "llizardos"
-#define SSH_PLUGIN_PATH  "/tmp/plugins"
+#define SSH_PLUGIN_PATH  "/usr/lib/llizard/plugins"
 
 // Connection status
 typedef enum {
