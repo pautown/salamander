@@ -115,3 +115,7 @@ Fire salamander palette:
 1. Check device has space: `ssh root@172.16.42.2 'df -h'`
 2. Ensure `/usr/lib/llizard/plugins` directory exists
 3. Check for permission errors in terminal output
+
+## Related Projects
+
+- **salamanders** (plural) - Per-plugin supporting files directory at `supporting_projects/salamanders/`. Contains subfolders for each plugin's resources, documentation, and development assets.
