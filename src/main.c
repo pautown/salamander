@@ -902,6 +902,11 @@ static void DrawMainPanel(const PluginInfo *plugin) {
     bool canUninstall = (plugin->remotePath[0] != '\0' && SshGetStatus() == SSH_STATUS_CONNECTED);
     bool isBusy = PluginBrowserIsBusy();
 
+    // Check which operation is in progress
+    const PluginOpState *opState = PluginBrowserGetOpState();
+    bool isInstalling = (opState->operation == OP_INSTALLING && !opState->complete);
+    bool isUninstalling = (opState->operation == OP_UNINSTALLING && !opState->complete);
+
     // Store button positions for click detection
     g_installBtn = (Rectangle){panelX + PANEL_PADDING, (float)y, BUTTON_WIDTH, BUTTON_HEIGHT};
     g_uninstallBtn = (Rectangle){panelX + PANEL_PADDING + BUTTON_WIDTH + BUTTON_SPACING, (float)y, BUTTON_WIDTH, BUTTON_HEIGHT};
@@ -910,97 +915,181 @@ static void DrawMainPanel(const PluginInfo *plugin) {
     bool installHovered = CheckCollisionPointRec(mouse, g_installBtn) && canInstall && !isBusy;
     bool uninstallHovered = CheckCollisionPointRec(mouse, g_uninstallBtn) && canUninstall && !isBusy;
 
-    // Install button with press animation
+    // ========== INSTALL BUTTON ==========
     float installPress = g_installBtnPress;
-    float installScale = 1.0f - installPress * 0.05f;  // Shrink slightly when pressed
-    float installOffsetY = installPress * 2.0f;        // Move down when pressed
+
+    // Lizard breathing animation when working
+    float installBreath = 0.0f;
+    float installWiggle = 0.0f;
+    if (isInstalling) {
+        installBreath = sinf(g_animTime * 3.0f) * 0.03f;  // Breathing pulse
+        installWiggle = sinf(g_animTime * 8.0f) * 1.5f;   // Quick wiggle like a lizard
+    }
+
+    float installScale = 1.0f - installPress * 0.05f + installBreath;
+    float installOffsetY = installPress * 2.0f;
+    float installOffsetX = installWiggle;
 
     Rectangle installDrawRect = {
-        g_installBtn.x + (g_installBtn.width * (1.0f - installScale)) / 2,
+        g_installBtn.x + installOffsetX + (g_installBtn.width * (1.0f - installScale)) / 2,
         g_installBtn.y + installOffsetY + (g_installBtn.height * (1.0f - installScale)) / 2,
         g_installBtn.width * installScale,
         g_installBtn.height * installScale
     };
 
     Color installBg;
-    if (canInstall && !isBusy) {
+    if (isInstalling) {
+        // Animated fire gradient when working - lizard on fire!
+        float firePhase = fmodf(g_animTime * 2.0f, 1.0f);
+        float firePulse = (sinf(g_animTime * 6.0f) + 1.0f) * 0.5f;
+        installBg = (Color){
+            (unsigned char)(180 + (int)(firePulse * 75)),  // R: 180-255
+            (unsigned char)(50 + (int)(firePhase * 80)),   // G: 50-130 crawling
+            (unsigned char)(10 + (int)(firePulse * 30)),   // B: 10-40
+            255
+        };
+    } else if (canInstall && !isBusy) {
         if (installPress > 0.1f) {
-            installBg = COLOR_GOLD;  // Flash gold when pressed
+            installBg = COLOR_GOLD;
         } else {
             installBg = installHovered ? COLOR_FLAME_ORANGE : COLOR_FIRE_DEEP;
         }
     } else {
         installBg = ColorWithAlpha(COLOR_FIRE_DEEP, 0.3f);
     }
-    Color installTextColor = (canInstall && !isBusy) ? COLOR_TEXT_BRIGHT : COLOR_TEXT_DIM;
+    Color installTextColor = (canInstall && !isBusy) || isInstalling ? COLOR_TEXT_BRIGHT : COLOR_TEXT_DIM;
 
-    // Glow effect when pressed
-    if (installPress > 0.1f) {
-        for (int i = 6; i > 0; i--) {
-            float alpha = (6 - i) / 6.0f * 0.3f * installPress;
+    // Glow effect when pressed or working
+    if (installPress > 0.1f || isInstalling) {
+        float glowIntensity = isInstalling ? (0.3f + sinf(g_animTime * 4.0f) * 0.2f) : (0.3f * installPress);
+        for (int i = 8; i > 0; i--) {
+            float alpha = (8 - i) / 8.0f * glowIntensity;
             Rectangle glowRect = {installDrawRect.x - i*2, installDrawRect.y - i*2,
                                   installDrawRect.width + i*4, installDrawRect.height + i*4};
-            DrawRectangleRounded(glowRect, BUTTON_RADIUS, 4, ColorWithAlpha(COLOR_GOLD, alpha));
+            Color glowColor = isInstalling ? COLOR_FLAME_ORANGE : COLOR_GOLD;
+            DrawRectangleRounded(glowRect, BUTTON_RADIUS, 4, ColorWithAlpha(glowColor, alpha));
         }
     }
 
     DrawRectangleRounded(installDrawRect, BUTTON_RADIUS, 4, installBg);
-    if (installHovered && installPress < 0.1f) {
+
+    // Fire crawl effect on border when working
+    if (isInstalling) {
+        float crawl = fmodf(g_animTime * 3.0f, 1.0f);
+        // Draw animated segments around the button
+        for (int seg = 0; seg < 6; seg++) {
+            float segPos = fmodf(crawl + seg * 0.166f, 1.0f);
+            float segAlpha = 0.5f + sinf(segPos * 3.14159f) * 0.5f;
+
+            float px, py;
+            if (segPos < 0.25f) {
+                px = installDrawRect.x + segPos * 4 * installDrawRect.width;
+                py = installDrawRect.y;
+            } else if (segPos < 0.5f) {
+                px = installDrawRect.x + installDrawRect.width;
+                py = installDrawRect.y + (segPos - 0.25f) * 4 * installDrawRect.height;
+            } else if (segPos < 0.75f) {
+                px = installDrawRect.x + installDrawRect.width - (segPos - 0.5f) * 4 * installDrawRect.width;
+                py = installDrawRect.y + installDrawRect.height;
+            } else {
+                px = installDrawRect.x;
+                py = installDrawRect.y + installDrawRect.height - (segPos - 0.75f) * 4 * installDrawRect.height;
+            }
+            DrawCircle((int)px, (int)py, 4, ColorWithAlpha(COLOR_GOLD, segAlpha * 0.8f));
+        }
+    } else if (installHovered && installPress < 0.1f) {
         DrawRectangleRoundedLines(installDrawRect, BUTTON_RADIUS, 4, ColorWithAlpha(COLOR_GOLD, 0.8f));
     }
-    Vector2 installSize = MeasureTextEx(g_font, "INSTALL", 16, 1);
-    DrawTextEx(g_font, "INSTALL",
+
+    const char *installLabel = isInstalling ? "INSTALLING..." : "INSTALL";
+    Vector2 installSize = MeasureTextEx(g_font, installLabel, 16, 1);
+    DrawTextEx(g_font, installLabel,
                (Vector2){installDrawRect.x + (installDrawRect.width - installSize.x) / 2,
                          installDrawRect.y + (installDrawRect.height - 16) / 2},
                16, 1, installTextColor);
 
-    // Uninstall button with press animation
+    // ========== UNINSTALL BUTTON ==========
     float uninstallPress = g_uninstallBtnPress;
-    float uninstallScale = 1.0f - uninstallPress * 0.05f;
+
+    // Lizard breathing animation when working
+    float uninstallBreath = 0.0f;
+    float uninstallWiggle = 0.0f;
+    if (isUninstalling) {
+        uninstallBreath = sinf(g_animTime * 3.0f) * 0.03f;
+        uninstallWiggle = sinf(g_animTime * 8.0f) * 1.5f;
+    }
+
+    float uninstallScale = 1.0f - uninstallPress * 0.05f + uninstallBreath;
     float uninstallOffsetY = uninstallPress * 2.0f;
+    float uninstallOffsetX = uninstallWiggle;
 
     Rectangle uninstallDrawRect = {
-        g_uninstallBtn.x + (g_uninstallBtn.width * (1.0f - uninstallScale)) / 2,
+        g_uninstallBtn.x + uninstallOffsetX + (g_uninstallBtn.width * (1.0f - uninstallScale)) / 2,
         g_uninstallBtn.y + uninstallOffsetY + (g_uninstallBtn.height * (1.0f - uninstallScale)) / 2,
         g_uninstallBtn.width * uninstallScale,
         g_uninstallBtn.height * uninstallScale
     };
 
     Color uninstallBg;
-    if (canUninstall && !isBusy) {
+    if (isUninstalling) {
+        // Animated cool-down gradient - ember fading
+        float coolPhase = fmodf(g_animTime * 2.0f, 1.0f);
+        float coolPulse = (sinf(g_animTime * 5.0f) + 1.0f) * 0.5f;
+        uninstallBg = (Color){
+            (unsigned char)(120 + (int)(coolPulse * 60)),   // R: dimming red
+            (unsigned char)(40 + (int)(coolPhase * 30)),    // G: slight variation
+            (unsigned char)(50 + (int)(coolPulse * 30)),    // B: cooler tones
+            255
+        };
+    } else if (canUninstall && !isBusy) {
         if (uninstallPress > 0.1f) {
-            uninstallBg = COLOR_DISCONNECTED;  // Flash red when pressed
+            uninstallBg = COLOR_DISCONNECTED;
         } else {
             uninstallBg = uninstallHovered ? (Color){74, 64, 68, 255} : COLOR_ASH;
         }
     } else {
         uninstallBg = ColorWithAlpha(COLOR_ASH, 0.3f);
     }
-    Color uninstallTextColor = (canUninstall && !isBusy) ? COLOR_TEXT_WARM : COLOR_TEXT_DIM;
+    Color uninstallTextColor = (canUninstall && !isBusy) || isUninstalling ? COLOR_TEXT_WARM : COLOR_TEXT_DIM;
 
-    // Glow effect when pressed
-    if (uninstallPress > 0.1f) {
-        for (int i = 6; i > 0; i--) {
-            float alpha = (6 - i) / 6.0f * 0.3f * uninstallPress;
+    // Glow effect when pressed or working
+    if (uninstallPress > 0.1f || isUninstalling) {
+        float glowIntensity = isUninstalling ? (0.25f + sinf(g_animTime * 4.0f) * 0.15f) : (0.3f * uninstallPress);
+        for (int i = 8; i > 0; i--) {
+            float alpha = (8 - i) / 8.0f * glowIntensity;
             Rectangle glowRect = {uninstallDrawRect.x - i*2, uninstallDrawRect.y - i*2,
                                   uninstallDrawRect.width + i*4, uninstallDrawRect.height + i*4};
-            DrawRectangleRounded(glowRect, BUTTON_RADIUS, 4, ColorWithAlpha(COLOR_DISCONNECTED, alpha));
+            Color glowColor = isUninstalling ? COLOR_EMBER : COLOR_DISCONNECTED;
+            DrawRectangleRounded(glowRect, BUTTON_RADIUS, 4, ColorWithAlpha(glowColor, alpha));
         }
     }
 
     DrawRectangleRounded(uninstallDrawRect, BUTTON_RADIUS, 4, uninstallBg);
-    if (uninstallHovered && uninstallPress < 0.1f) {
+
+    // Smoke/ash particle effect when uninstalling
+    if (isUninstalling) {
+        for (int p = 0; p < 5; p++) {
+            float t = fmodf(g_animTime * 1.5f + p * 0.2f, 1.0f);
+            float px = uninstallDrawRect.x + uninstallDrawRect.width * (0.2f + p * 0.15f);
+            float py = uninstallDrawRect.y - t * 20;
+            float alpha = (1.0f - t) * 0.4f;
+            float size = 2 + t * 3;
+            DrawCircle((int)px, (int)py, size, ColorWithAlpha(COLOR_TEXT_DIM, alpha));
+        }
+    } else if (uninstallHovered && uninstallPress < 0.1f) {
         DrawRectangleRoundedLines(uninstallDrawRect, BUTTON_RADIUS, 4, ColorWithAlpha(COLOR_DISCONNECTED, 0.8f));
     }
-    Vector2 uninstallSize = MeasureTextEx(g_font, "UNINSTALL", 16, 1);
-    DrawTextEx(g_font, "UNINSTALL",
+
+    const char *uninstallLabel = isUninstalling ? "REMOVING..." : "UNINSTALL";
+    Vector2 uninstallSize = MeasureTextEx(g_font, uninstallLabel, 16, 1);
+    DrawTextEx(g_font, uninstallLabel,
                (Vector2){uninstallDrawRect.x + (uninstallDrawRect.width - uninstallSize.x) / 2,
                          uninstallDrawRect.y + (uninstallDrawRect.height - 16) / 2},
                16, 1, uninstallTextColor);
 
     y += BUTTON_HEIGHT + 30;
 
-    const PluginOpState *opState = PluginBrowserGetOpState();
+    // Progress bar (opState already defined above)
     if (opState->operation != OP_NONE || (opState->complete && g_animTime < 3.0f)) {
         Rectangle progressBounds = {panelX + PANEL_PADDING, (float)y, panelW - PANEL_PADDING * 2, PROGRESS_HEIGHT};
         DrawProgressBar(progressBounds, opState->progress, opState->message);

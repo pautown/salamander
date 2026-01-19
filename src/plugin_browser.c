@@ -6,6 +6,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <ctype.h>
+#include <pthread.h>
 
 // ============================================================================
 // Plugin Browser Implementation
@@ -14,6 +15,13 @@
 static char g_localPath[512] = "";
 static PluginList g_plugins = {0};
 static PluginOpState g_opState = {0};
+
+// Threading for async operations
+static pthread_t g_workerThread;
+static bool g_threadRunning = false;
+static char g_pendingPluginName[64] = "";
+static char g_pendingLocalPath[512] = "";
+static char g_pendingRemotePath[512] = "";
 
 // Convert filename to display name (nowplaying.so -> Now Playing)
 static void MakeDisplayName(const char *filename, char *display, size_t maxLen) {
@@ -242,23 +250,12 @@ static void InstallProgressCallback(float progress, const char *message, void *u
     snprintf(g_opState.message, sizeof(g_opState.message), "%s", message);
 }
 
-bool PluginBrowserInstall(const char *pluginName) {
-    const PluginInfo *plugin = PluginBrowserFindPlugin(pluginName);
-    if (!plugin || plugin->localPath[0] == '\0') {
-        snprintf(g_opState.message, sizeof(g_opState.message), "Plugin not found locally");
-        return false;
-    }
+// ============================================================================
+// Async Worker Threads
+// ============================================================================
 
-    if (SshGetStatus() != SSH_STATUS_CONNECTED) {
-        snprintf(g_opState.message, sizeof(g_opState.message), "Device not connected");
-        return false;
-    }
-
-    g_opState.operation = OP_INSTALLING;
-    g_opState.progress = 0.0f;
-    g_opState.complete = false;
-    strncpy(g_opState.pluginName, pluginName, sizeof(g_opState.pluginName) - 1);
-    snprintf(g_opState.message, sizeof(g_opState.message), "Installing %s...", pluginName);
+static void *InstallWorkerThread(void *arg) {
+    (void)arg;
 
     // Step 1: Enable read-write mode
     printf("Install: Enabling read-write mode...\n");
@@ -275,12 +272,9 @@ bool PluginBrowserInstall(const char *pluginName) {
     snprintf(g_opState.message, sizeof(g_opState.message), "Creating directory...");
     SshExecute("mkdir -p " SSH_PLUGIN_PATH);
 
-    // Step 3: Build remote path and copy file
-    char remotePath[512];
-    snprintf(remotePath, sizeof(remotePath), "%s/%s.so", SSH_PLUGIN_PATH, pluginName);
-
-    printf("Install: Copying %s to %s...\n", plugin->localPath, remotePath);
-    bool success = SshCopyToDevice(plugin->localPath, remotePath,
+    // Step 3: Copy file
+    printf("Install: Copying %s to %s...\n", g_pendingLocalPath, g_pendingRemotePath);
+    bool success = SshCopyToDevice(g_pendingLocalPath, g_pendingRemotePath,
                                    InstallProgressCallback, NULL);
 
     // Step 4: Sync filesystem
@@ -293,35 +287,21 @@ bool PluginBrowserInstall(const char *pluginName) {
 
     g_opState.complete = true;
     g_opState.success = success;
-    g_opState.operation = OP_NONE;
 
     if (success) {
-        printf("Install: Successfully installed %s\n", pluginName);
-        snprintf(g_opState.message, sizeof(g_opState.message), "Installed %s", pluginName);
+        printf("Install: Successfully installed %s\n", g_pendingPluginName);
+        snprintf(g_opState.message, sizeof(g_opState.message), "Installed %s", g_pendingPluginName);
     } else {
-        printf("Install: Failed to install %s\n", pluginName);
+        printf("Install: Failed to install %s\n", g_pendingPluginName);
+        snprintf(g_opState.message, sizeof(g_opState.message), "Failed to install %s", g_pendingPluginName);
     }
 
-    return success;
+    g_threadRunning = false;
+    return NULL;
 }
 
-bool PluginBrowserUninstall(const char *pluginName) {
-    const PluginInfo *plugin = PluginBrowserFindPlugin(pluginName);
-    if (!plugin || plugin->remotePath[0] == '\0') {
-        snprintf(g_opState.message, sizeof(g_opState.message), "Plugin not installed on device");
-        return false;
-    }
-
-    if (SshGetStatus() != SSH_STATUS_CONNECTED) {
-        snprintf(g_opState.message, sizeof(g_opState.message), "Device not connected");
-        return false;
-    }
-
-    g_opState.operation = OP_UNINSTALLING;
-    g_opState.progress = 0.0f;
-    g_opState.complete = false;
-    strncpy(g_opState.pluginName, pluginName, sizeof(g_opState.pluginName) - 1);
-    snprintf(g_opState.message, sizeof(g_opState.message), "Uninstalling %s...", pluginName);
+static void *UninstallWorkerThread(void *arg) {
+    (void)arg;
 
     // Step 1: Enable read-write mode
     printf("Uninstall: Enabling read-write mode...\n");
@@ -332,36 +312,34 @@ bool PluginBrowserUninstall(const char *pluginName) {
         printf("Uninstall: Warning - could not remount rw: %s\n", rwResult.output);
     }
 
-    // Step 2: Stop llizardgui service if running (to release any file handles)
+    // Step 2: Stop llizardgui service if running
     printf("Uninstall: Stopping llizardgui service...\n");
     g_opState.progress = 0.2f;
     snprintf(g_opState.message, sizeof(g_opState.message), "Stopping service...");
     SshExecute("sv stop llizardgui 2>/dev/null || true");
-    // Also try killing the process directly in case it's not running as a service
     SshExecute("pkill -f llizardgui-host 2>/dev/null || true");
 
     // Step 3: Delete the plugin file
-    printf("Uninstall: Deleting plugin file: %s\n", plugin->remotePath);
+    printf("Uninstall: Deleting plugin file: %s\n", g_pendingRemotePath);
     g_opState.progress = 0.4f;
     snprintf(g_opState.message, sizeof(g_opState.message), "Deleting plugin...");
 
     char deleteCmd[1024];
-    snprintf(deleteCmd, sizeof(deleteCmd), "rm -f '%s'", plugin->remotePath);
+    snprintf(deleteCmd, sizeof(deleteCmd), "rm -f '%s'", g_pendingRemotePath);
     SshResult deleteResult = SshExecute(deleteCmd);
     printf("Uninstall: Delete result: success=%d, output=%s\n", deleteResult.success, deleteResult.output);
 
-    // Step 4: Delete any related config/data files for this plugin
-    printf("Uninstall: Cleaning up related files for %s...\n", pluginName);
+    // Step 4: Delete any related config/data files
+    printf("Uninstall: Cleaning up related files for %s...\n", g_pendingPluginName);
     g_opState.progress = 0.6f;
     snprintf(g_opState.message, sizeof(g_opState.message), "Cleaning up...");
 
-    // Delete plugin config directory if it exists
     char cleanupCmd[1024];
     snprintf(cleanupCmd, sizeof(cleanupCmd),
              "rm -rf /var/lib/llizard/plugins/%s 2>/dev/null || true; "
              "rm -rf /tmp/llizard/%s 2>/dev/null || true; "
              "rm -f /etc/llizard/plugins/%s.conf 2>/dev/null || true",
-             pluginName, pluginName, pluginName);
+             g_pendingPluginName, g_pendingPluginName, g_pendingPluginName);
     SshExecute(cleanupCmd);
 
     // Step 5: Sync filesystem
@@ -377,22 +355,117 @@ bool PluginBrowserUninstall(const char *pluginName) {
     SshExecute("sv start llizardgui 2>/dev/null || true");
 
     // Verify the file is actually deleted
-    bool success = !SshFileExists(plugin->remotePath);
+    bool success = !SshFileExists(g_pendingRemotePath);
 
     g_opState.complete = true;
     g_opState.success = success;
     g_opState.progress = 1.0f;
-    g_opState.operation = OP_NONE;
 
     if (success) {
-        printf("Uninstall: Successfully uninstalled %s\n", pluginName);
-        snprintf(g_opState.message, sizeof(g_opState.message), "Uninstalled %s", pluginName);
+        printf("Uninstall: Successfully uninstalled %s\n", g_pendingPluginName);
+        snprintf(g_opState.message, sizeof(g_opState.message), "Uninstalled %s", g_pendingPluginName);
     } else {
-        printf("Uninstall: Failed to uninstall %s (file may still exist)\n", pluginName);
-        snprintf(g_opState.message, sizeof(g_opState.message), "Failed to uninstall %s", pluginName);
+        printf("Uninstall: Failed to uninstall %s (file may still exist)\n", g_pendingPluginName);
+        snprintf(g_opState.message, sizeof(g_opState.message), "Failed to uninstall %s", g_pendingPluginName);
     }
 
-    return success;
+    g_threadRunning = false;
+    return NULL;
+}
+
+// ============================================================================
+// Public API (now async)
+// ============================================================================
+
+bool PluginBrowserInstall(const char *pluginName) {
+    // Don't start if already busy
+    if (g_threadRunning) {
+        snprintf(g_opState.message, sizeof(g_opState.message), "Operation in progress");
+        return false;
+    }
+
+    const PluginInfo *plugin = PluginBrowserFindPlugin(pluginName);
+    if (!plugin || plugin->localPath[0] == '\0') {
+        snprintf(g_opState.message, sizeof(g_opState.message), "Plugin not found locally");
+        return false;
+    }
+
+    if (SshGetStatus() != SSH_STATUS_CONNECTED) {
+        snprintf(g_opState.message, sizeof(g_opState.message), "Device not connected");
+        return false;
+    }
+
+    // Setup operation state
+    g_opState.operation = OP_INSTALLING;
+    g_opState.progress = 0.0f;
+    g_opState.complete = false;
+    strncpy(g_opState.pluginName, pluginName, sizeof(g_opState.pluginName) - 1);
+    snprintf(g_opState.message, sizeof(g_opState.message), "Installing %s...", pluginName);
+
+    // Copy paths for worker thread
+    strncpy(g_pendingPluginName, pluginName, sizeof(g_pendingPluginName) - 1);
+    strncpy(g_pendingLocalPath, plugin->localPath, sizeof(g_pendingLocalPath) - 1);
+    snprintf(g_pendingRemotePath, sizeof(g_pendingRemotePath), "%s/%s.so", SSH_PLUGIN_PATH, pluginName);
+
+    // Start worker thread
+    g_threadRunning = true;
+    if (pthread_create(&g_workerThread, NULL, InstallWorkerThread, NULL) != 0) {
+        g_threadRunning = false;
+        g_opState.complete = true;
+        g_opState.success = false;
+        snprintf(g_opState.message, sizeof(g_opState.message), "Failed to start install thread");
+        return false;
+    }
+
+    // Detach thread so it cleans up automatically
+    pthread_detach(g_workerThread);
+
+    return true;
+}
+
+bool PluginBrowserUninstall(const char *pluginName) {
+    // Don't start if already busy
+    if (g_threadRunning) {
+        snprintf(g_opState.message, sizeof(g_opState.message), "Operation in progress");
+        return false;
+    }
+
+    const PluginInfo *plugin = PluginBrowserFindPlugin(pluginName);
+    if (!plugin || plugin->remotePath[0] == '\0') {
+        snprintf(g_opState.message, sizeof(g_opState.message), "Plugin not installed on device");
+        return false;
+    }
+
+    if (SshGetStatus() != SSH_STATUS_CONNECTED) {
+        snprintf(g_opState.message, sizeof(g_opState.message), "Device not connected");
+        return false;
+    }
+
+    // Setup operation state
+    g_opState.operation = OP_UNINSTALLING;
+    g_opState.progress = 0.0f;
+    g_opState.complete = false;
+    strncpy(g_opState.pluginName, pluginName, sizeof(g_opState.pluginName) - 1);
+    snprintf(g_opState.message, sizeof(g_opState.message), "Uninstalling %s...", pluginName);
+
+    // Copy paths for worker thread
+    strncpy(g_pendingPluginName, pluginName, sizeof(g_pendingPluginName) - 1);
+    strncpy(g_pendingRemotePath, plugin->remotePath, sizeof(g_pendingRemotePath) - 1);
+
+    // Start worker thread
+    g_threadRunning = true;
+    if (pthread_create(&g_workerThread, NULL, UninstallWorkerThread, NULL) != 0) {
+        g_threadRunning = false;
+        g_opState.complete = true;
+        g_opState.success = false;
+        snprintf(g_opState.message, sizeof(g_opState.message), "Failed to start uninstall thread");
+        return false;
+    }
+
+    // Detach thread so it cleans up automatically
+    pthread_detach(g_workerThread);
+
+    return true;
 }
 
 const PluginOpState *PluginBrowserGetOpState(void) {
@@ -400,7 +473,7 @@ const PluginOpState *PluginBrowserGetOpState(void) {
 }
 
 bool PluginBrowserIsBusy(void) {
-    return g_opState.operation != OP_NONE;
+    return g_threadRunning || (g_opState.operation != OP_NONE && !g_opState.complete);
 }
 
 void FormatFileSize(long bytes, char *buffer, size_t bufSize) {
