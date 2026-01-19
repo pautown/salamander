@@ -6,12 +6,13 @@ A desktop raylib application for installing and uninstalling llizardgui-host plu
 
 ## Features
 
-- Browse local and device-installed plugins
+- **Three-section sidebar**: Device Only, Synced (both), Local Only
+- **Drag-and-drop**: Drag plugins between sections to install/uninstall
 - Install plugins to CarThing via SCP
 - Uninstall plugins from CarThing via SSH
 - Fire-themed UI with animated ember glow effects
 - Real-time connection status monitoring
-- Smooth scrolling and selection animations
+- Visual drag feedback with action hints
 
 ## Prerequisites
 
@@ -47,16 +48,26 @@ Default local plugin path: `../../build-armv7-drm` (relative to build directory)
 | Key | Action |
 |-----|--------|
 | Up/Down | Navigate plugin list |
-| Tab | Switch between Local/Device view |
-| Enter | Install selected plugin |
+| Tab | Switch between sections |
+| Enter | Install selected plugin (if local only) |
 | Delete/Backspace | Uninstall selected plugin |
 | R | Refresh plugin lists |
 | Escape | Close application |
 
-### Mouse
+### Mouse / Drag-and-Drop
 
-- Click INSTALL button to install selected plugin
-- Click UNINSTALL button to remove selected plugin
+- **Click** a plugin to select it
+- **Drag from LOCAL ONLY to SYNCED/DEVICE** to install
+- **Drag from SYNCED/DEVICE to LOCAL ONLY** to uninstall
+- Click INSTALL/UNINSTALL buttons in the detail panel
+
+### Plugin Sections
+
+| Section | Description |
+|---------|-------------|
+| **DEVICE ONLY** | Plugins installed on CarThing but not in local build |
+| **SYNCED** | Plugins present in both local build and on device |
+| **LOCAL ONLY** | Plugins in local build, not yet installed on device |
 
 ## Connection Settings
 

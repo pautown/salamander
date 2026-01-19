@@ -13,24 +13,42 @@
 // A fire-themed desktop application for managing llizardgui plugins
 // ============================================================================
 
-// State
-static int g_selectedIndex = 0;
-static float g_scrollOffset = 0.0f;
-static float g_targetScroll = 0.0f;
+// Section types for the three-column layout
+typedef enum {
+    SECTION_DEVICE_ONLY,    // Plugins only on device
+    SECTION_SYNCED,         // Plugins on both local and device
+    SECTION_LOCAL_ONLY      // Plugins only on local machine
+} SectionType;
+
+// Selection state
+typedef struct {
+    SectionType section;
+    int index;              // Index within section
+} Selection;
+
+// Drag state
+typedef struct {
+    bool isDragging;
+    char pluginName[64];
+    SectionType sourceSection;
+    Vector2 startPos;
+    Vector2 currentPos;
+    float dragTime;
+} DragState;
+
+// Global state
+static Selection g_selection = {SECTION_LOCAL_ONLY, 0};
+static DragState g_drag = {0};
 static float g_animTime = 0.0f;
 static float g_connectionCheckTimer = 0.0f;
 static bool g_needsRefresh = true;
 
+// Section rectangles for drop detection
+static Rectangle g_sectionRects[3] = {0};
+
 // Font
 static Font g_font;
 static bool g_fontLoaded = false;
-
-// View state
-typedef enum {
-    VIEW_LOCAL,
-    VIEW_DEVICE
-} ViewMode;
-static ViewMode g_viewMode = VIEW_LOCAL;
 
 // Forward declarations
 static void LoadAppFont(void);
@@ -42,8 +60,11 @@ static void DrawSidebar(const PluginList *plugins, float deltaTime);
 static void DrawMainPanel(const PluginInfo *selectedPlugin);
 static void DrawFooter(void);
 static void DrawProgressBar(Rectangle bounds, float progress, const char *label);
-static void UpdateScrolling(int itemCount, float deltaTime);
+static void DrawDragGhost(void);
 static void HandleInput(const PluginList *plugins);
+static const PluginInfo *GetSelectedPlugin(const PluginList *plugins);
+static void GetSectionCounts(const PluginList *plugins, int *deviceOnly, int *synced, int *localOnly);
+static const PluginInfo *GetPluginInSection(const PluginList *plugins, SectionType section, int index);
 
 // ============================================================================
 // Font Loading
@@ -81,13 +102,12 @@ static void LoadAppFont(void) {
     int count = 0;
     int *codepoints = BuildCodepoints(&count);
 
-    // Paths relative to build directory (supporting_projects/salamander/build/)
     const char *paths[] = {
-        "../../../fonts/ZegoeUI-U.ttf",           // Main project fonts
+        "../../../fonts/ZegoeUI-U.ttf",
         "../../fonts/ZegoeUI-U.ttf",
         "../fonts/ZegoeUI-U.ttf",
         "fonts/ZegoeUI-U.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",  // System fallback
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     };
 
     g_font = GetFontDefault();
@@ -112,18 +132,75 @@ static void UnloadAppFont(void) {
 }
 
 // ============================================================================
+// Helper Functions
+// ============================================================================
+
+static void GetSectionCounts(const PluginList *plugins, int *deviceOnly, int *synced, int *localOnly) {
+    *deviceOnly = 0;
+    *synced = 0;
+    *localOnly = 0;
+
+    for (int i = 0; i < plugins->count; i++) {
+        const PluginInfo *p = &plugins->plugins[i];
+        bool hasLocal = (p->localPath[0] != '\0');
+        bool hasRemote = (p->remotePath[0] != '\0');
+
+        if (hasLocal && hasRemote) {
+            (*synced)++;
+        } else if (hasRemote) {
+            (*deviceOnly)++;
+        } else if (hasLocal) {
+            (*localOnly)++;
+        }
+    }
+}
+
+static const PluginInfo *GetPluginInSection(const PluginList *plugins, SectionType section, int index) {
+    int count = 0;
+    for (int i = 0; i < plugins->count; i++) {
+        const PluginInfo *p = &plugins->plugins[i];
+        bool hasLocal = (p->localPath[0] != '\0');
+        bool hasRemote = (p->remotePath[0] != '\0');
+
+        bool inSection = false;
+        if (section == SECTION_SYNCED && hasLocal && hasRemote) inSection = true;
+        else if (section == SECTION_DEVICE_ONLY && hasRemote && !hasLocal) inSection = true;
+        else if (section == SECTION_LOCAL_ONLY && hasLocal && !hasRemote) inSection = true;
+
+        if (inSection) {
+            if (count == index) return p;
+            count++;
+        }
+    }
+    return NULL;
+}
+
+static const PluginInfo *GetSelectedPlugin(const PluginList *plugins) {
+    return GetPluginInSection(plugins, g_selection.section, g_selection.index);
+}
+
+static int GetSectionCount(const PluginList *plugins, SectionType section) {
+    int deviceOnly, synced, localOnly;
+    GetSectionCounts(plugins, &deviceOnly, &synced, &localOnly);
+    switch (section) {
+        case SECTION_DEVICE_ONLY: return deviceOnly;
+        case SECTION_SYNCED: return synced;
+        case SECTION_LOCAL_ONLY: return localOnly;
+    }
+    return 0;
+}
+
+// ============================================================================
 // Drawing Functions
 // ============================================================================
 
 static void DrawBackground(void) {
-    // Dark gradient background
     DrawRectangleGradientV(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT,
                            COLOR_CHARCOAL_DARK,
                            (Color){20, 18, 18, 255});
 }
 
 static void DrawEmberGlow(float time) {
-    // Animated ember glow at screen edges
     float pulse = (sinf(time * GLOW_SPEED) + 1.0f) * 0.5f;
     float glowAlpha = LERP(EMBER_GLOW_MIN, EMBER_GLOW_MAX, pulse);
 
@@ -134,7 +211,7 @@ static void DrawEmberGlow(float time) {
         DrawRectangle(0, i, WINDOW_WIDTH, 1, glow);
     }
 
-    // Bottom glow (stronger)
+    // Bottom glow
     for (int i = 0; i < 60; i++) {
         float alpha = glowAlpha * (1.0f - i / 60.0f) * 0.2f;
         Color glow = ColorWithAlpha(COLOR_EMBER, alpha);
@@ -149,15 +226,12 @@ static void DrawEmberGlow(float time) {
 }
 
 static void DrawHeader(void) {
-    // Header background
     DrawRectangle(0, 0, WINDOW_WIDTH, HEADER_HEIGHT, COLOR_WARM_GRAY);
 
-    // Bottom border with fire accent
     float pulse = (sinf(g_animTime * 2.0f) + 1.0f) * 0.5f;
     Color borderColor = ColorWithAlpha(COLOR_FIRE_DEEP, 0.6f + pulse * 0.4f);
     DrawRectangle(0, HEADER_HEIGHT - 2, WINDOW_WIDTH, 2, borderColor);
 
-    // Title
     DrawTextEx(g_font, "SALAMANDER",
                (Vector2){HEADER_PADDING, (HEADER_HEIGHT - 24) / 2},
                24, 1, COLOR_FIRE_DEEP);
@@ -194,103 +268,205 @@ static void DrawHeader(void) {
                18, 1, statusColor);
 }
 
+static void DrawSectionHeader(const char *title, int y, Color accentColor, bool isDropTarget) {
+    // Highlight if drop target
+    if (isDropTarget && g_drag.isDragging) {
+        DrawRectangle(SIDEBAR_PADDING - 8, y - 4, SIDEBAR_WIDTH - SIDEBAR_PADDING * 2 + 16, 22,
+                      ColorWithAlpha(accentColor, 0.3f));
+    }
+    DrawTextEx(g_font, title, (Vector2){SIDEBAR_PADDING, (float)y}, 14, 1, accentColor);
+}
+
+static void DrawPluginItem(const PluginInfo *p, int y, bool selected, bool isDragSource, Color accentColor) {
+    Rectangle itemRect = {SIDEBAR_PADDING - 4, (float)y, SIDEBAR_WIDTH - SIDEBAR_PADDING * 2 + 8, SIDEBAR_ITEM_HEIGHT};
+
+    // Dim if being dragged
+    float alpha = isDragSource ? 0.3f : 1.0f;
+
+    if (selected && !isDragSource) {
+        DrawRectangleRounded(itemRect, 0.2f, 4, COLOR_CARD_SELECTED);
+        DrawRectangle((int)itemRect.x, (int)itemRect.y + 6, 3, (int)itemRect.height - 12, accentColor);
+    }
+
+    Color textColor = selected ? COLOR_TEXT_BRIGHT : COLOR_TEXT_WARM;
+    textColor = ColorWithAlpha(textColor, alpha);
+
+    DrawTextEx(g_font, p->displayName, (Vector2){SIDEBAR_PADDING + 8, y + 10.0f}, 16, 1, textColor);
+}
+
 static void DrawSidebar(const PluginList *plugins, float deltaTime) {
     (void)deltaTime;
 
-    // Sidebar background
     DrawRectangle(0, HEADER_HEIGHT, SIDEBAR_WIDTH, WINDOW_HEIGHT - HEADER_HEIGHT - FOOTER_HEIGHT,
                   COLOR_WARM_GRAY);
-
-    // Right border
     DrawRectangle(SIDEBAR_WIDTH - 1, HEADER_HEIGHT, 1,
                   WINDOW_HEIGHT - HEADER_HEIGHT - FOOTER_HEIGHT,
                   ColorWithAlpha(COLOR_FIRE_DEEP, 0.3f));
 
+    int deviceOnly, synced, localOnly;
+    GetSectionCounts(plugins, &deviceOnly, &synced, &localOnly);
+
     int y = HEADER_HEIGHT + SIDEBAR_PADDING;
+    Vector2 mouse = GetMousePosition();
 
-    // Section: Local Plugins
-    DrawTextEx(g_font, "LOCAL PLUGINS", (Vector2){SIDEBAR_PADDING, (float)y}, 14, 1, COLOR_TEXT_DIM);
+    // Check which section mouse is over for drop targeting
+    SectionType hoverSection = SECTION_LOCAL_ONLY;
+    bool mouseInSidebar = (mouse.x < SIDEBAR_WIDTH && mouse.y > HEADER_HEIGHT && mouse.y < WINDOW_HEIGHT - FOOTER_HEIGHT);
+
+    // =========== SECTION: DEVICE ONLY ===========
+    int sectionStartY = y;
+    bool isDropTarget = g_drag.isDragging && g_drag.sourceSection == SECTION_LOCAL_ONLY && mouseInSidebar;
+
+    // Check if mouse is in this section
+    int sectionHeight = 24 + (deviceOnly > 0 ? deviceOnly * (SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING) : 20);
+    g_sectionRects[SECTION_DEVICE_ONLY] = (Rectangle){0, (float)sectionStartY, SIDEBAR_WIDTH, (float)sectionHeight};
+    if (mouseInSidebar && mouse.y >= sectionStartY && mouse.y < sectionStartY + sectionHeight) {
+        hoverSection = SECTION_DEVICE_ONLY;
+    }
+
+    DrawSectionHeader("DEVICE ONLY", y, COLOR_INSTALLING, isDropTarget && hoverSection == SECTION_DEVICE_ONLY);
     y += 24;
 
-    // Count local plugins
-    int localCount = 0;
-    for (int i = 0; i < plugins->count; i++) {
-        if (plugins->plugins[i].localPath[0] != '\0') localCount++;
-    }
-
-    if (localCount == 0) {
-        DrawTextEx(g_font, "No local plugins", (Vector2){SIDEBAR_PADDING, (float)y}, 14, 1, COLOR_TEXT_DIM);
-        y += SIDEBAR_ITEM_HEIGHT;
-    }
-
-    // Draw local plugins
-    int listIndex = 0;
-    for (int i = 0; i < plugins->count; i++) {
-        const PluginInfo *p = &plugins->plugins[i];
-        if (p->localPath[0] == '\0') continue;
-
-        bool selected = (listIndex == g_selectedIndex && g_viewMode == VIEW_LOCAL);
-        Rectangle itemRect = {SIDEBAR_PADDING - 4, (float)y, SIDEBAR_WIDTH - SIDEBAR_PADDING * 2 + 8, SIDEBAR_ITEM_HEIGHT};
-
-        if (selected) {
-            // Selected background
-            DrawRectangleRounded(itemRect, 0.2f, 4, COLOR_CARD_SELECTED);
-            // Fire accent bar
-            DrawRectangle((int)itemRect.x, (int)itemRect.y + 6, 3, (int)itemRect.height - 12, COLOR_FIRE_DEEP);
+    if (deviceOnly == 0) {
+        const char *msg = (SshGetStatus() == SSH_STATUS_CONNECTED) ? "(none)" : "(connect to view)";
+        DrawTextEx(g_font, msg, (Vector2){SIDEBAR_PADDING, (float)y}, 12, 1, COLOR_TEXT_DIM);
+        y += 20;
+    } else {
+        int idx = 0;
+        for (int i = 0; i < plugins->count; i++) {
+            const PluginInfo *p = &plugins->plugins[i];
+            if (p->remotePath[0] != '\0' && p->localPath[0] == '\0') {
+                bool selected = (g_selection.section == SECTION_DEVICE_ONLY && g_selection.index == idx);
+                bool isDragSource = g_drag.isDragging && strcmp(g_drag.pluginName, p->name) == 0;
+                DrawPluginItem(p, y, selected, isDragSource, COLOR_INSTALLING);
+                y += SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING;
+                idx++;
+            }
         }
-
-        // Status indicator
-        const char *indicator = (p->status == PLUGIN_INSTALLED) ? "*" : "o";
-        Color indicatorColor = (p->status == PLUGIN_INSTALLED) ? COLOR_CONNECTED : COLOR_TEXT_DIM;
-        DrawTextEx(g_font, indicator, (Vector2){SIDEBAR_PADDING + 4, y + 10.0f}, 16, 1, indicatorColor);
-
-        // Plugin name
-        Color textColor = selected ? COLOR_TEXT_BRIGHT : COLOR_TEXT_WARM;
-        DrawTextEx(g_font, p->displayName, (Vector2){SIDEBAR_PADDING + 20, y + 10.0f}, 16, 1, textColor);
-
-        y += SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING;
-        listIndex++;
     }
 
-    y += SIDEBAR_SECTION_SPACING;
+    y += SIDEBAR_SECTION_SPACING / 2;
 
-    // Section: Device Plugins
-    DrawTextEx(g_font, "DEVICE PLUGINS", (Vector2){SIDEBAR_PADDING, (float)y}, 14, 1, COLOR_TEXT_DIM);
+    // =========== SECTION: SYNCED (BOTH) ===========
+    sectionStartY = y;
+    sectionHeight = 24 + (synced > 0 ? synced * (SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING) : 20);
+    g_sectionRects[SECTION_SYNCED] = (Rectangle){0, (float)sectionStartY, SIDEBAR_WIDTH, (float)sectionHeight};
+    if (mouseInSidebar && mouse.y >= sectionStartY && mouse.y < sectionStartY + sectionHeight) {
+        hoverSection = SECTION_SYNCED;
+    }
+
+    isDropTarget = g_drag.isDragging && g_drag.sourceSection == SECTION_LOCAL_ONLY && mouseInSidebar;
+    DrawSectionHeader("SYNCED", y, COLOR_CONNECTED, isDropTarget && hoverSection == SECTION_SYNCED);
     y += 24;
 
-    // Count device plugins
-    int deviceCount = 0;
-    for (int i = 0; i < plugins->count; i++) {
-        if (plugins->plugins[i].remotePath[0] != '\0') deviceCount++;
+    if (synced == 0) {
+        DrawTextEx(g_font, "(none)", (Vector2){SIDEBAR_PADDING, (float)y}, 12, 1, COLOR_TEXT_DIM);
+        y += 20;
+    } else {
+        int idx = 0;
+        for (int i = 0; i < plugins->count; i++) {
+            const PluginInfo *p = &plugins->plugins[i];
+            if (p->remotePath[0] != '\0' && p->localPath[0] != '\0') {
+                bool selected = (g_selection.section == SECTION_SYNCED && g_selection.index == idx);
+                bool isDragSource = g_drag.isDragging && strcmp(g_drag.pluginName, p->name) == 0;
+                DrawPluginItem(p, y, selected, isDragSource, COLOR_CONNECTED);
+                y += SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING;
+                idx++;
+            }
+        }
     }
 
-    if (deviceCount == 0) {
-        const char *msg = (SshGetStatus() == SSH_STATUS_CONNECTED) ? "No plugins installed" : "Connect to view";
-        DrawTextEx(g_font, msg, (Vector2){SIDEBAR_PADDING, (float)y}, 14, 1, COLOR_TEXT_DIM);
+    y += SIDEBAR_SECTION_SPACING / 2;
+
+    // =========== SECTION: LOCAL ONLY ===========
+    sectionStartY = y;
+    sectionHeight = 24 + (localOnly > 0 ? localOnly * (SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING) : 20);
+    g_sectionRects[SECTION_LOCAL_ONLY] = (Rectangle){0, (float)sectionStartY, SIDEBAR_WIDTH, (float)sectionHeight};
+    if (mouseInSidebar && mouse.y >= sectionStartY && mouse.y < sectionStartY + sectionHeight) {
+        hoverSection = SECTION_LOCAL_ONLY;
     }
 
-    // Draw device plugins
-    listIndex = 0;
-    for (int i = 0; i < plugins->count; i++) {
-        const PluginInfo *p = &plugins->plugins[i];
-        if (p->remotePath[0] == '\0') continue;
+    isDropTarget = g_drag.isDragging && (g_drag.sourceSection == SECTION_SYNCED || g_drag.sourceSection == SECTION_DEVICE_ONLY) && mouseInSidebar;
+    DrawSectionHeader("LOCAL ONLY", y, COLOR_EMBER, isDropTarget && hoverSection == SECTION_LOCAL_ONLY);
+    y += 24;
 
-        bool selected = (listIndex == g_selectedIndex && g_viewMode == VIEW_DEVICE);
-        Rectangle itemRect = {SIDEBAR_PADDING - 4, (float)y, SIDEBAR_WIDTH - SIDEBAR_PADDING * 2 + 8, SIDEBAR_ITEM_HEIGHT};
+    if (localOnly == 0) {
+        DrawTextEx(g_font, "(none)", (Vector2){SIDEBAR_PADDING, (float)y}, 12, 1, COLOR_TEXT_DIM);
+        y += 20;
+    } else {
+        int idx = 0;
+        for (int i = 0; i < plugins->count; i++) {
+            const PluginInfo *p = &plugins->plugins[i];
+            if (p->localPath[0] != '\0' && p->remotePath[0] == '\0') {
+                bool selected = (g_selection.section == SECTION_LOCAL_ONLY && g_selection.index == idx);
+                bool isDragSource = g_drag.isDragging && strcmp(g_drag.pluginName, p->name) == 0;
+                DrawPluginItem(p, y, selected, isDragSource, COLOR_EMBER);
+                y += SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING;
+                idx++;
+            }
+        }
+    }
 
-        if (selected) {
-            DrawRectangleRounded(itemRect, 0.2f, 4, COLOR_CARD_SELECTED);
-            DrawRectangle((int)itemRect.x, (int)itemRect.y + 6, 3, (int)itemRect.height - 12, COLOR_EMBER);
+    // Draw drop zone highlight when dragging
+    if (g_drag.isDragging && mouseInSidebar) {
+        Rectangle dropRect = g_sectionRects[hoverSection];
+        bool validDrop = false;
+
+        // Validate drop: LOCAL -> DEVICE/SYNCED = install, DEVICE/SYNCED -> LOCAL = uninstall
+        if (g_drag.sourceSection == SECTION_LOCAL_ONLY &&
+            (hoverSection == SECTION_DEVICE_ONLY || hoverSection == SECTION_SYNCED)) {
+            validDrop = true;  // Install
+        } else if ((g_drag.sourceSection == SECTION_SYNCED || g_drag.sourceSection == SECTION_DEVICE_ONLY) &&
+                   hoverSection == SECTION_LOCAL_ONLY) {
+            validDrop = true;  // Uninstall
         }
 
-        // Status indicator (all device plugins are installed by definition)
-        DrawTextEx(g_font, "*", (Vector2){SIDEBAR_PADDING + 4, y + 10.0f}, 16, 1, COLOR_CONNECTED);
+        if (validDrop) {
+            Color dropColor = ColorWithAlpha(COLOR_GOLD, 0.2f + sinf(g_animTime * 4.0f) * 0.1f);
+            DrawRectangleRec(dropRect, dropColor);
+            DrawRectangleLinesEx(dropRect, 2, ColorWithAlpha(COLOR_GOLD, 0.6f));
+        }
+    }
+}
 
-        Color textColor = selected ? COLOR_TEXT_BRIGHT : COLOR_TEXT_WARM;
-        DrawTextEx(g_font, p->displayName, (Vector2){SIDEBAR_PADDING + 20, y + 10.0f}, 16, 1, textColor);
+static void DrawDragGhost(void) {
+    if (!g_drag.isDragging) return;
 
-        y += SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING;
-        listIndex++;
+    Vector2 mouse = GetMousePosition();
+
+    // Draw ghost following cursor
+    float ghostAlpha = 0.7f + sinf(g_animTime * 6.0f) * 0.2f;
+    Rectangle ghostRect = {mouse.x + 10, mouse.y - 15, 150, 30};
+
+    DrawRectangleRounded(ghostRect, 0.3f, 4, ColorWithAlpha(COLOR_FIRE_DEEP, ghostAlpha * 0.8f));
+    DrawRectangleRoundedLines(ghostRect, 0.3f, 4, ColorWithAlpha(COLOR_GOLD, ghostAlpha));
+
+    DrawTextEx(g_font, g_drag.pluginName,
+               (Vector2){ghostRect.x + 8, ghostRect.y + 7},
+               14, 1, ColorWithAlpha(COLOR_TEXT_BRIGHT, ghostAlpha));
+
+    // Draw action hint
+    const char *hint = NULL;
+    Vector2 mousePos = GetMousePosition();
+    bool inSidebar = mousePos.x < SIDEBAR_WIDTH;
+
+    if (inSidebar) {
+        for (int i = 0; i < 3; i++) {
+            if (CheckCollisionPointRec(mousePos, g_sectionRects[i])) {
+                if (g_drag.sourceSection == SECTION_LOCAL_ONLY && (i == SECTION_DEVICE_ONLY || i == SECTION_SYNCED)) {
+                    hint = "Drop to INSTALL";
+                } else if ((g_drag.sourceSection == SECTION_SYNCED || g_drag.sourceSection == SECTION_DEVICE_ONLY) && i == SECTION_LOCAL_ONLY) {
+                    hint = "Drop to UNINSTALL";
+                }
+                break;
+            }
+        }
+    }
+
+    if (hint) {
+        DrawTextEx(g_font, hint,
+                   (Vector2){mouse.x + 10, mouse.y + 20},
+                   12, 1, COLOR_GOLD);
     }
 }
 
@@ -300,19 +476,21 @@ static void DrawMainPanel(const PluginInfo *plugin) {
     int panelW = WINDOW_WIDTH - PANEL_START_X;
     int panelH = WINDOW_HEIGHT - HEADER_HEIGHT - FOOTER_HEIGHT;
 
-    // Panel background
     DrawRectangle(panelX, panelY, panelW, panelH, COLOR_CHARCOAL_DARK);
 
     if (!plugin) {
         DrawTextEx(g_font, "Select a plugin",
                    (Vector2){panelX + PANEL_PADDING, panelY + PANEL_PADDING + 50},
                    20, 1, COLOR_TEXT_DIM);
+        DrawTextEx(g_font, "Drag plugins between sections to install/uninstall",
+                   (Vector2){panelX + PANEL_PADDING, panelY + PANEL_PADDING + 80},
+                   14, 1, COLOR_TEXT_DIM);
         return;
     }
 
     int y = panelY + PANEL_PADDING;
 
-    // Plugin name (large)
+    // Plugin name
     DrawTextEx(g_font, plugin->displayName, (Vector2){panelX + PANEL_PADDING, (float)y}, 32, 2, COLOR_TEXT_BRIGHT);
     y += 48;
 
@@ -322,11 +500,10 @@ static void DrawMainPanel(const PluginInfo *plugin) {
     DrawRectangle(panelX + PANEL_PADDING, y, 200, 2, lineColor);
     y += 20;
 
-    // Description placeholder
     DrawTextEx(g_font, "llizardgui plugin", (Vector2){panelX + PANEL_PADDING, (float)y}, 16, 1, COLOR_TEXT_DIM);
     y += 30;
 
-    // File size info
+    // File sizes
     char sizeStr[64];
     if (plugin->localSize > 0) {
         FormatFileSize(plugin->localSize, sizeStr, sizeof(sizeStr));
@@ -351,7 +528,7 @@ static void DrawMainPanel(const PluginInfo *plugin) {
     Color statusColor;
     switch (plugin->status) {
         case PLUGIN_INSTALLED:
-            statusText = "Installed";
+            statusText = "Synced (on both)";
             statusColor = COLOR_CONNECTED;
             break;
         case PLUGIN_LOCAL_ONLY:
@@ -369,7 +546,7 @@ static void DrawMainPanel(const PluginInfo *plugin) {
     y += 50;
 
     // Action buttons
-    bool canInstall = (plugin->localPath[0] != '\0' && SshGetStatus() == SSH_STATUS_CONNECTED);
+    bool canInstall = (plugin->localPath[0] != '\0' && plugin->remotePath[0] == '\0' && SshGetStatus() == SSH_STATUS_CONNECTED);
     bool canUninstall = (plugin->remotePath[0] != '\0' && SshGetStatus() == SSH_STATUS_CONNECTED);
     bool isBusy = PluginBrowserIsBusy();
 
@@ -398,7 +575,7 @@ static void DrawMainPanel(const PluginInfo *plugin) {
 
     y += BUTTON_HEIGHT + 30;
 
-    // Progress bar (if operation in progress)
+    // Progress bar
     const PluginOpState *opState = PluginBrowserGetOpState();
     if (opState->operation != OP_NONE || (opState->complete && g_animTime < 3.0f)) {
         Rectangle progressBounds = {panelX + PANEL_PADDING, (float)y, panelW - PANEL_PADDING * 2, PROGRESS_HEIGHT};
@@ -407,24 +584,19 @@ static void DrawMainPanel(const PluginInfo *plugin) {
 }
 
 static void DrawProgressBar(Rectangle bounds, float progress, const char *label) {
-    // Background
     DrawRectangleRounded(bounds, PROGRESS_RADIUS, 4, COLOR_ASH);
 
-    // Fill
     Rectangle fill = {bounds.x + 2, bounds.y + 2, (bounds.width - 4) * progress, bounds.height - 4};
     if (fill.width > 0) {
-        // Gradient fill from fire deep to ember
         Color fillColor = (progress >= 1.0f) ? COLOR_CONNECTED : COLOR_FIRE_DEEP;
         DrawRectangleRounded(fill, PROGRESS_RADIUS, 4, fillColor);
     }
 
-    // Label
     if (label && label[0]) {
         float labelY = bounds.y + bounds.height + 8;
         DrawTextEx(g_font, label, (Vector2){bounds.x, labelY}, 14, 1, COLOR_TEXT_DIM);
     }
 
-    // Percentage
     char pctStr[16];
     snprintf(pctStr, sizeof(pctStr), "%.0f%%", progress * 100);
     Vector2 pctSize = MeasureTextEx(g_font, pctStr, 12, 1);
@@ -436,119 +608,101 @@ static void DrawProgressBar(Rectangle bounds, float progress, const char *label)
 static void DrawFooter(void) {
     int footerY = WINDOW_HEIGHT - FOOTER_HEIGHT;
 
-    // Footer background
     DrawRectangle(0, footerY, WINDOW_WIDTH, FOOTER_HEIGHT, COLOR_WARM_GRAY);
-
-    // Top border
     DrawRectangle(0, footerY, WINDOW_WIDTH, 1, ColorWithAlpha(COLOR_FIRE_DEEP, 0.3f));
 
-    // Instructions
-    const char *instructions = "Up/Down: Navigate  |  Tab: Switch view  |  Enter: Install  |  Delete: Uninstall  |  R: Refresh";
+    const char *instructions = "Drag to install/uninstall  |  Arrow keys: Navigate  |  Tab: Switch section  |  R: Refresh";
     DrawTextEx(g_font, instructions,
                (Vector2){HEADER_PADDING, footerY + (FOOTER_HEIGHT - 14) / 2.0f},
                14, 1, COLOR_TEXT_DIM);
 }
 
 // ============================================================================
-// Input and Logic
+// Input Handling
 // ============================================================================
 
-static void UpdateScrolling(int itemCount, float deltaTime) {
-    if (itemCount == 0) return;
-
-    // Calculate target scroll to keep selection visible
-    float itemHeight = SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING;
-    float selectedY = g_selectedIndex * itemHeight;
-    float visibleHeight = WINDOW_HEIGHT - HEADER_HEIGHT - FOOTER_HEIGHT - 100;
-
-    float targetTop = g_targetScroll;
-    float targetBottom = g_targetScroll + visibleHeight;
-
-    if (selectedY < targetTop + 20) {
-        g_targetScroll = selectedY - 20;
-    } else if (selectedY + itemHeight > targetBottom - 20) {
-        g_targetScroll = selectedY + itemHeight - visibleHeight + 20;
-    }
-
-    // Clamp
-    float maxScroll = itemCount * itemHeight - visibleHeight;
-    if (maxScroll < 0) maxScroll = 0;
-    if (g_targetScroll < 0) g_targetScroll = 0;
-    if (g_targetScroll > maxScroll) g_targetScroll = maxScroll;
-
-    // Smooth interpolation
-    float diff = g_targetScroll - g_scrollOffset;
-    g_scrollOffset += diff * SCROLL_SPEED * deltaTime;
-    if (fabsf(diff) < 0.5f) g_scrollOffset = g_targetScroll;
-}
-
 static void HandleInput(const PluginList *plugins) {
-    // Get counts for current view
-    int localCount = 0, deviceCount = 0;
-    for (int i = 0; i < plugins->count; i++) {
-        if (plugins->plugins[i].localPath[0] != '\0') localCount++;
-        if (plugins->plugins[i].remotePath[0] != '\0') deviceCount++;
+    Vector2 mouse = GetMousePosition();
+    bool isBusy = PluginBrowserIsBusy();
+
+    int deviceOnly, synced, localOnly;
+    GetSectionCounts(plugins, &deviceOnly, &synced, &localOnly);
+
+    // Keyboard navigation
+    if (IsKeyPressed(KEY_TAB)) {
+        // Cycle through sections
+        int tries = 3;
+        do {
+            g_selection.section = (g_selection.section + 1) % 3;
+            g_selection.index = 0;
+            tries--;
+        } while (GetSectionCount(plugins, g_selection.section) == 0 && tries > 0);
     }
 
-    int currentCount = (g_viewMode == VIEW_LOCAL) ? localCount : deviceCount;
-
-    // Navigation
+    int currentCount = GetSectionCount(plugins, g_selection.section);
     if (IsKeyPressed(KEY_DOWN) && currentCount > 0) {
-        g_selectedIndex = (g_selectedIndex + 1) % currentCount;
+        g_selection.index = (g_selection.index + 1) % currentCount;
     }
     if (IsKeyPressed(KEY_UP) && currentCount > 0) {
-        g_selectedIndex = (g_selectedIndex - 1 + currentCount) % currentCount;
+        g_selection.index = (g_selection.index - 1 + currentCount) % currentCount;
     }
 
-    // Switch view with Tab
-    if (IsKeyPressed(KEY_TAB)) {
-        g_viewMode = (g_viewMode == VIEW_LOCAL) ? VIEW_DEVICE : VIEW_LOCAL;
-        g_selectedIndex = 0;
-    }
-
-    // Refresh with R
+    // Refresh
     if (IsKeyPressed(KEY_R)) {
         g_needsRefresh = true;
     }
 
-    // Get selected plugin
-    const PluginInfo *selectedPlugin = NULL;
-    int idx = 0;
-    if (g_viewMode == VIEW_LOCAL) {
-        for (int i = 0; i < plugins->count && !selectedPlugin; i++) {
-            if (plugins->plugins[i].localPath[0] != '\0') {
-                if (idx == g_selectedIndex) selectedPlugin = &plugins->plugins[i];
-                idx++;
-            }
-        }
-    } else {
-        for (int i = 0; i < plugins->count && !selectedPlugin; i++) {
-            if (plugins->plugins[i].remotePath[0] != '\0') {
-                if (idx == g_selectedIndex) selectedPlugin = &plugins->plugins[i];
-                idx++;
-            }
-        }
-    }
-
-    // Install with Enter
-    if (IsKeyPressed(KEY_ENTER) && selectedPlugin && !PluginBrowserIsBusy()) {
-        if (selectedPlugin->localPath[0] != '\0' && SshGetStatus() == SSH_STATUS_CONNECTED) {
+    // Keyboard install/uninstall
+    const PluginInfo *selectedPlugin = GetSelectedPlugin(plugins);
+    if (IsKeyPressed(KEY_ENTER) && selectedPlugin && !isBusy) {
+        if (selectedPlugin->localPath[0] != '\0' && selectedPlugin->remotePath[0] == '\0' &&
+            SshGetStatus() == SSH_STATUS_CONNECTED) {
             PluginBrowserInstall(selectedPlugin->name);
             g_needsRefresh = true;
         }
     }
-
-    // Uninstall with Delete or Backspace
-    if ((IsKeyPressed(KEY_DELETE) || IsKeyPressed(KEY_BACKSPACE)) && selectedPlugin && !PluginBrowserIsBusy()) {
+    if ((IsKeyPressed(KEY_DELETE) || IsKeyPressed(KEY_BACKSPACE)) && selectedPlugin && !isBusy) {
         if (selectedPlugin->remotePath[0] != '\0' && SshGetStatus() == SSH_STATUS_CONNECTED) {
             PluginBrowserUninstall(selectedPlugin->name);
             g_needsRefresh = true;
         }
     }
 
-    // Mouse click on buttons
-    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && selectedPlugin && !PluginBrowserIsBusy()) {
-        Vector2 mouse = GetMousePosition();
+    // Mouse click selection
+    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && mouse.x < SIDEBAR_WIDTH && !isBusy) {
+        // Check which section and item was clicked
+        for (int section = 0; section < 3; section++) {
+            if (CheckCollisionPointRec(mouse, g_sectionRects[section])) {
+                int itemY = (int)g_sectionRects[section].y + 24;  // After header
+                int count = GetSectionCount(plugins, section);
+
+                for (int i = 0; i < count; i++) {
+                    Rectangle itemRect = {SIDEBAR_PADDING - 4, (float)itemY,
+                                          SIDEBAR_WIDTH - SIDEBAR_PADDING * 2 + 8, SIDEBAR_ITEM_HEIGHT};
+                    if (CheckCollisionPointRec(mouse, itemRect)) {
+                        g_selection.section = section;
+                        g_selection.index = i;
+
+                        // Start drag
+                        const PluginInfo *p = GetPluginInSection(plugins, section, i);
+                        if (p) {
+                            g_drag.isDragging = true;
+                            strncpy(g_drag.pluginName, p->name, sizeof(g_drag.pluginName) - 1);
+                            g_drag.sourceSection = section;
+                            g_drag.startPos = mouse;
+                            g_drag.dragTime = 0;
+                        }
+                        break;
+                    }
+                    itemY += SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING;
+                }
+                break;
+            }
+        }
+    }
+
+    // Mouse button click on main panel buttons
+    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && selectedPlugin && !isBusy && mouse.x >= PANEL_START_X) {
         int panelX = PANEL_START_X;
         int buttonY = HEADER_HEIGHT + PANEL_PADDING + 48 + 20 + 30 + 24 + 24 + 10 + 50;
 
@@ -556,7 +710,8 @@ static void HandleInput(const PluginList *plugins) {
         Rectangle uninstallBtn = {panelX + PANEL_PADDING + BUTTON_WIDTH + BUTTON_SPACING, (float)buttonY, BUTTON_WIDTH, BUTTON_HEIGHT};
 
         if (CheckCollisionPointRec(mouse, installBtn)) {
-            if (selectedPlugin->localPath[0] != '\0' && SshGetStatus() == SSH_STATUS_CONNECTED) {
+            if (selectedPlugin->localPath[0] != '\0' && selectedPlugin->remotePath[0] == '\0' &&
+                SshGetStatus() == SSH_STATUS_CONNECTED) {
                 PluginBrowserInstall(selectedPlugin->name);
                 g_needsRefresh = true;
             }
@@ -567,6 +722,45 @@ static void HandleInput(const PluginList *plugins) {
             }
         }
     }
+
+    // Update drag
+    if (g_drag.isDragging) {
+        g_drag.currentPos = mouse;
+        g_drag.dragTime += GetFrameTime();
+
+        // Cancel if moved too little (was just a click)
+        float dragDist = sqrtf(powf(mouse.x - g_drag.startPos.x, 2) + powf(mouse.y - g_drag.startPos.y, 2));
+        if (dragDist < 5 && g_drag.dragTime < 0.15f && IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) {
+            g_drag.isDragging = false;
+        }
+
+        // Handle drop
+        if (IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) {
+            if (mouse.x < SIDEBAR_WIDTH && !isBusy && SshGetStatus() == SSH_STATUS_CONNECTED) {
+                for (int section = 0; section < 3; section++) {
+                    if (CheckCollisionPointRec(mouse, g_sectionRects[section])) {
+                        // Validate and perform action
+                        if (g_drag.sourceSection == SECTION_LOCAL_ONLY &&
+                            (section == SECTION_DEVICE_ONLY || section == SECTION_SYNCED)) {
+                            // Install
+                            printf("Salamander: Installing %s (dragged to device)\n", g_drag.pluginName);
+                            PluginBrowserInstall(g_drag.pluginName);
+                            g_needsRefresh = true;
+                        } else if ((g_drag.sourceSection == SECTION_SYNCED || g_drag.sourceSection == SECTION_DEVICE_ONLY) &&
+                                   section == SECTION_LOCAL_ONLY) {
+                            // Uninstall
+                            printf("Salamander: Uninstalling %s (dragged to local)\n", g_drag.pluginName);
+                            PluginBrowserUninstall(g_drag.pluginName);
+                            g_needsRefresh = true;
+                        }
+                        break;
+                    }
+                }
+            }
+
+            g_drag.isDragging = false;
+        }
+    }
 }
 
 // ============================================================================
@@ -574,24 +768,19 @@ static void HandleInput(const PluginList *plugins) {
 // ============================================================================
 
 int main(int argc, char *argv[]) {
-    // Parse command line for local plugin path
-    // Default path relative to build directory (supporting_projects/salamander/build/)
     const char *localPath = "../../../build-armv7-drm";
     if (argc > 1) {
         localPath = argv[1];
     }
 
-    // Initialize
     SetConfigFlags(FLAG_MSAA_4X_HINT);
     InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "Salamander - Plugin Manager");
     SetTargetFPS(TARGET_FPS);
     LoadAppFont();
 
-    // Initialize managers
-    SshInit(NULL, NULL, NULL);  // Use defaults
+    SshInit(NULL, NULL, NULL);
     PluginBrowserInit(localPath);
 
-    // Resolve and print absolute path for clarity
     char absPath[512] = {0};
     if (realpath(localPath, absPath)) {
         printf("Salamander: Looking for plugins in %s\n", absPath);
@@ -600,10 +789,8 @@ int main(int argc, char *argv[]) {
     }
     printf("Salamander: Will connect to CarThing at %s\n", SshGetHost());
 
-    // Initial connection check
     SshCheckConnection();
 
-    // Main loop
     while (!WindowShouldClose()) {
         float deltaTime = GetFrameTime();
         g_animTime += deltaTime;
@@ -615,45 +802,23 @@ int main(int argc, char *argv[]) {
             g_connectionCheckTimer = 0.0f;
         }
 
-        // Refresh plugins if needed
+        // Refresh plugins
         if (g_needsRefresh && !PluginBrowserIsBusy()) {
             PluginBrowserRefresh();
             g_needsRefresh = false;
+
+            // Reset selection if invalid
+            int count = GetSectionCount(PluginBrowserGetList(), g_selection.section);
+            if (g_selection.index >= count) {
+                g_selection.index = count > 0 ? count - 1 : 0;
+            }
         }
 
-        // Get plugin list
         const PluginList *plugins = PluginBrowserGetList();
-
-        // Handle input
         HandleInput(plugins);
 
-        // Update scrolling
-        int localCount = 0;
-        for (int i = 0; i < plugins->count; i++) {
-            if (plugins->plugins[i].localPath[0] != '\0') localCount++;
-        }
-        UpdateScrolling(localCount, deltaTime);
+        const PluginInfo *selectedPlugin = GetSelectedPlugin(plugins);
 
-        // Get selected plugin for main panel
-        const PluginInfo *selectedPlugin = NULL;
-        int idx = 0;
-        if (g_viewMode == VIEW_LOCAL) {
-            for (int i = 0; i < plugins->count && !selectedPlugin; i++) {
-                if (plugins->plugins[i].localPath[0] != '\0') {
-                    if (idx == g_selectedIndex) selectedPlugin = &plugins->plugins[i];
-                    idx++;
-                }
-            }
-        } else {
-            for (int i = 0; i < plugins->count && !selectedPlugin; i++) {
-                if (plugins->plugins[i].remotePath[0] != '\0') {
-                    if (idx == g_selectedIndex) selectedPlugin = &plugins->plugins[i];
-                    idx++;
-                }
-            }
-        }
-
-        // Draw
         BeginDrawing();
         ClearBackground(COLOR_CHARCOAL_DARK);
 
@@ -663,11 +828,11 @@ int main(int argc, char *argv[]) {
         DrawSidebar(plugins, deltaTime);
         DrawMainPanel(selectedPlugin);
         DrawFooter();
+        DrawDragGhost();
 
         EndDrawing();
     }
 
-    // Cleanup
     PluginBrowserShutdown();
     SshShutdown();
     UnloadAppFont();
