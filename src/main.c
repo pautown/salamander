@@ -43,7 +43,16 @@ static float g_animTime = 0.0f;
 static float g_connectionCheckTimer = 0.0f;
 static bool g_needsRefresh = true;
 
-// Section rectangles for drop detection
+// Smooth scrolling state
+static float g_scrollOffset = 0.0f;
+static float g_targetScroll = 0.0f;
+static float g_totalContentHeight = 0.0f;
+
+// Sidebar content area
+#define SIDEBAR_CONTENT_TOP (HEADER_HEIGHT)
+#define SIDEBAR_CONTENT_HEIGHT (WINDOW_HEIGHT - HEADER_HEIGHT - FOOTER_HEIGHT)
+
+// Section rectangles for drop detection (in content space, before scroll)
 static Rectangle g_sectionRects[3] = {0};
 
 // Font
@@ -62,9 +71,12 @@ static void DrawFooter(void);
 static void DrawProgressBar(Rectangle bounds, float progress, const char *label);
 static void DrawDragGhost(void);
 static void HandleInput(const PluginList *plugins);
+static void UpdateScroll(float deltaTime);
+static void ScrollToSelection(const PluginList *plugins);
 static const PluginInfo *GetSelectedPlugin(const PluginList *plugins);
 static void GetSectionCounts(const PluginList *plugins, int *deviceOnly, int *synced, int *localOnly);
 static const PluginInfo *GetPluginInSection(const PluginList *plugins, SectionType section, int index);
+static float GetSelectionY(const PluginList *plugins);
 
 // ============================================================================
 // Font Loading
@@ -190,6 +202,91 @@ static int GetSectionCount(const PluginList *plugins, SectionType section) {
     return 0;
 }
 
+// Calculate Y position of selected item in content space (before scroll)
+static float GetSelectionY(const PluginList *plugins) {
+    int deviceOnly, synced, localOnly;
+    GetSectionCounts(plugins, &deviceOnly, &synced, &localOnly);
+
+    float y = SIDEBAR_PADDING;
+
+    // DEVICE ONLY section
+    y += 24;  // Header
+    if (deviceOnly == 0) {
+        y += 20;
+    } else {
+        if (g_selection.section == SECTION_DEVICE_ONLY) {
+            return y + g_selection.index * (SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING);
+        }
+        y += deviceOnly * (SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING);
+    }
+    y += SIDEBAR_SECTION_SPACING / 2;
+
+    // SYNCED section
+    y += 24;  // Header
+    if (synced == 0) {
+        y += 20;
+    } else {
+        if (g_selection.section == SECTION_SYNCED) {
+            return y + g_selection.index * (SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING);
+        }
+        y += synced * (SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING);
+    }
+    y += SIDEBAR_SECTION_SPACING / 2;
+
+    // LOCAL ONLY section
+    y += 24;  // Header
+    if (g_selection.section == SECTION_LOCAL_ONLY) {
+        return y + g_selection.index * (SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING);
+    }
+
+    return y;
+}
+
+// ============================================================================
+// Scrolling
+// ============================================================================
+
+static void UpdateScroll(float deltaTime) {
+    // Smooth interpolation (glass on glass effect)
+    float diff = g_targetScroll - g_scrollOffset;
+    float speed = 12.0f;
+
+    g_scrollOffset += diff * speed * deltaTime;
+
+    // Snap when very close
+    if (fabsf(diff) < 0.5f) {
+        g_scrollOffset = g_targetScroll;
+    }
+}
+
+static void ScrollToSelection(const PluginList *plugins) {
+    float selY = GetSelectionY(plugins);
+    float itemHeight = SIDEBAR_ITEM_HEIGHT;
+
+    // Calculate visible area
+    float visibleTop = g_targetScroll;
+    float visibleBottom = g_targetScroll + SIDEBAR_CONTENT_HEIGHT;
+
+    // Margins
+    float topMargin = 40;
+    float bottomMargin = 60;
+
+    // Calculate max scroll
+    float maxScroll = g_totalContentHeight - SIDEBAR_CONTENT_HEIGHT;
+    if (maxScroll < 0) maxScroll = 0;
+
+    // Scroll to keep selection visible
+    if (selY < visibleTop + topMargin) {
+        g_targetScroll = selY - topMargin;
+    } else if (selY + itemHeight > visibleBottom - bottomMargin) {
+        g_targetScroll = selY + itemHeight - SIDEBAR_CONTENT_HEIGHT + bottomMargin;
+    }
+
+    // Clamp
+    if (g_targetScroll < 0) g_targetScroll = 0;
+    if (g_targetScroll > maxScroll) g_targetScroll = maxScroll;
+}
+
 // ============================================================================
 // Drawing Functions
 // ============================================================================
@@ -204,21 +301,18 @@ static void DrawEmberGlow(float time) {
     float pulse = (sinf(time * GLOW_SPEED) + 1.0f) * 0.5f;
     float glowAlpha = LERP(EMBER_GLOW_MIN, EMBER_GLOW_MAX, pulse);
 
-    // Top glow
     for (int i = 0; i < 40; i++) {
         float alpha = glowAlpha * (1.0f - i / 40.0f) * 0.15f;
         Color glow = ColorWithAlpha(COLOR_FIRE_DEEP, alpha);
         DrawRectangle(0, i, WINDOW_WIDTH, 1, glow);
     }
 
-    // Bottom glow
     for (int i = 0; i < 60; i++) {
         float alpha = glowAlpha * (1.0f - i / 60.0f) * 0.2f;
         Color glow = ColorWithAlpha(COLOR_EMBER, alpha);
         DrawRectangle(0, WINDOW_HEIGHT - 60 + i, WINDOW_WIDTH, 1, glow);
     }
 
-    // Corner accents
     float cornerPulse = (sinf(time * PULSE_SPEED + 1.5f) + 1.0f) * 0.5f;
     Color cornerColor = ColorWithAlpha(COLOR_FIRE_DEEP, 0.1f + cornerPulse * 0.1f);
     DrawCircleGradient(0, 0, 150, cornerColor, BLANK);
@@ -236,7 +330,6 @@ static void DrawHeader(void) {
                (Vector2){HEADER_PADDING, (HEADER_HEIGHT - 24) / 2},
                24, 1, COLOR_FIRE_DEEP);
 
-    // Connection status
     SshConnectionStatus status = SshGetStatus();
     const char *statusText;
     Color statusColor;
@@ -268,19 +361,17 @@ static void DrawHeader(void) {
                18, 1, statusColor);
 }
 
-static void DrawSectionHeader(const char *title, int y, Color accentColor, bool isDropTarget) {
-    // Highlight if drop target
+static void DrawSectionHeader(const char *title, float y, Color accentColor, bool isDropTarget) {
     if (isDropTarget && g_drag.isDragging) {
-        DrawRectangle(SIDEBAR_PADDING - 8, y - 4, SIDEBAR_WIDTH - SIDEBAR_PADDING * 2 + 16, 22,
+        DrawRectangle(SIDEBAR_PADDING - 8, (int)y - 4, SIDEBAR_WIDTH - SIDEBAR_PADDING * 2 + 16, 22,
                       ColorWithAlpha(accentColor, 0.3f));
     }
-    DrawTextEx(g_font, title, (Vector2){SIDEBAR_PADDING, (float)y}, 14, 1, accentColor);
+    DrawTextEx(g_font, title, (Vector2){SIDEBAR_PADDING, y}, 14, 1, accentColor);
 }
 
-static void DrawPluginItem(const PluginInfo *p, int y, bool selected, bool isDragSource, Color accentColor) {
-    Rectangle itemRect = {SIDEBAR_PADDING - 4, (float)y, SIDEBAR_WIDTH - SIDEBAR_PADDING * 2 + 8, SIDEBAR_ITEM_HEIGHT};
+static void DrawPluginItem(const PluginInfo *p, float y, bool selected, bool isDragSource, Color accentColor) {
+    Rectangle itemRect = {SIDEBAR_PADDING - 4, y, SIDEBAR_WIDTH - SIDEBAR_PADDING * 2 + 8, SIDEBAR_ITEM_HEIGHT};
 
-    // Dim if being dragged
     float alpha = isDragSource ? 0.3f : 1.0f;
 
     if (selected && !isDragSource) {
@@ -297,40 +388,48 @@ static void DrawPluginItem(const PluginInfo *p, int y, bool selected, bool isDra
 static void DrawSidebar(const PluginList *plugins, float deltaTime) {
     (void)deltaTime;
 
-    DrawRectangle(0, HEADER_HEIGHT, SIDEBAR_WIDTH, WINDOW_HEIGHT - HEADER_HEIGHT - FOOTER_HEIGHT,
-                  COLOR_WARM_GRAY);
-    DrawRectangle(SIDEBAR_WIDTH - 1, HEADER_HEIGHT, 1,
-                  WINDOW_HEIGHT - HEADER_HEIGHT - FOOTER_HEIGHT,
+    // Sidebar background
+    DrawRectangle(0, HEADER_HEIGHT, SIDEBAR_WIDTH, SIDEBAR_CONTENT_HEIGHT, COLOR_WARM_GRAY);
+    DrawRectangle(SIDEBAR_WIDTH - 1, HEADER_HEIGHT, 1, SIDEBAR_CONTENT_HEIGHT,
                   ColorWithAlpha(COLOR_FIRE_DEEP, 0.3f));
 
     int deviceOnly, synced, localOnly;
     GetSectionCounts(plugins, &deviceOnly, &synced, &localOnly);
 
-    int y = HEADER_HEIGHT + SIDEBAR_PADDING;
     Vector2 mouse = GetMousePosition();
-
-    // Check which section mouse is over for drop targeting
-    SectionType hoverSection = SECTION_LOCAL_ONLY;
     bool mouseInSidebar = (mouse.x < SIDEBAR_WIDTH && mouse.y > HEADER_HEIGHT && mouse.y < WINDOW_HEIGHT - FOOTER_HEIGHT);
 
-    // =========== SECTION: DEVICE ONLY ===========
-    int sectionStartY = y;
-    bool isDropTarget = g_drag.isDragging && g_drag.sourceSection == SECTION_LOCAL_ONLY && mouseInSidebar;
+    // Begin scissor mode for scrolling content
+    BeginScissorMode(0, SIDEBAR_CONTENT_TOP, SIDEBAR_WIDTH, SIDEBAR_CONTENT_HEIGHT);
 
-    // Check if mouse is in this section
+    // Content Y starts at padding, offset by scroll
+    float y = SIDEBAR_CONTENT_TOP + SIDEBAR_PADDING - g_scrollOffset;
+    float contentY = SIDEBAR_PADDING;  // For section rect calculation (without screen offset)
+
+    // Adjusted mouse Y for scroll
+    float adjustedMouseY = mouse.y - SIDEBAR_CONTENT_TOP + g_scrollOffset;
+
+    SectionType hoverSection = SECTION_LOCAL_ONLY;
+
+    // =========== SECTION: DEVICE ONLY ===========
+    float sectionStartY = contentY;
     int sectionHeight = 24 + (deviceOnly > 0 ? deviceOnly * (SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING) : 20);
-    g_sectionRects[SECTION_DEVICE_ONLY] = (Rectangle){0, (float)sectionStartY, SIDEBAR_WIDTH, (float)sectionHeight};
-    if (mouseInSidebar && mouse.y >= sectionStartY && mouse.y < sectionStartY + sectionHeight) {
+    g_sectionRects[SECTION_DEVICE_ONLY] = (Rectangle){0, sectionStartY, SIDEBAR_WIDTH, (float)sectionHeight};
+
+    if (mouseInSidebar && adjustedMouseY >= sectionStartY && adjustedMouseY < sectionStartY + sectionHeight) {
         hoverSection = SECTION_DEVICE_ONLY;
     }
 
+    bool isDropTarget = g_drag.isDragging && g_drag.sourceSection == SECTION_LOCAL_ONLY && mouseInSidebar;
     DrawSectionHeader("DEVICE ONLY", y, COLOR_INSTALLING, isDropTarget && hoverSection == SECTION_DEVICE_ONLY);
     y += 24;
+    contentY += 24;
 
     if (deviceOnly == 0) {
         const char *msg = (SshGetStatus() == SSH_STATUS_CONNECTED) ? "(none)" : "(connect to view)";
-        DrawTextEx(g_font, msg, (Vector2){SIDEBAR_PADDING, (float)y}, 12, 1, COLOR_TEXT_DIM);
+        DrawTextEx(g_font, msg, (Vector2){SIDEBAR_PADDING, y}, 12, 1, COLOR_TEXT_DIM);
         y += 20;
+        contentY += 20;
     } else {
         int idx = 0;
         for (int i = 0; i < plugins->count; i++) {
@@ -340,28 +439,33 @@ static void DrawSidebar(const PluginList *plugins, float deltaTime) {
                 bool isDragSource = g_drag.isDragging && strcmp(g_drag.pluginName, p->name) == 0;
                 DrawPluginItem(p, y, selected, isDragSource, COLOR_INSTALLING);
                 y += SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING;
+                contentY += SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING;
                 idx++;
             }
         }
     }
 
     y += SIDEBAR_SECTION_SPACING / 2;
+    contentY += SIDEBAR_SECTION_SPACING / 2;
 
-    // =========== SECTION: SYNCED (BOTH) ===========
-    sectionStartY = y;
+    // =========== SECTION: SYNCED ===========
+    sectionStartY = contentY;
     sectionHeight = 24 + (synced > 0 ? synced * (SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING) : 20);
-    g_sectionRects[SECTION_SYNCED] = (Rectangle){0, (float)sectionStartY, SIDEBAR_WIDTH, (float)sectionHeight};
-    if (mouseInSidebar && mouse.y >= sectionStartY && mouse.y < sectionStartY + sectionHeight) {
+    g_sectionRects[SECTION_SYNCED] = (Rectangle){0, sectionStartY, SIDEBAR_WIDTH, (float)sectionHeight};
+
+    if (mouseInSidebar && adjustedMouseY >= sectionStartY && adjustedMouseY < sectionStartY + sectionHeight) {
         hoverSection = SECTION_SYNCED;
     }
 
     isDropTarget = g_drag.isDragging && g_drag.sourceSection == SECTION_LOCAL_ONLY && mouseInSidebar;
     DrawSectionHeader("SYNCED", y, COLOR_CONNECTED, isDropTarget && hoverSection == SECTION_SYNCED);
     y += 24;
+    contentY += 24;
 
     if (synced == 0) {
-        DrawTextEx(g_font, "(none)", (Vector2){SIDEBAR_PADDING, (float)y}, 12, 1, COLOR_TEXT_DIM);
+        DrawTextEx(g_font, "(none)", (Vector2){SIDEBAR_PADDING, y}, 12, 1, COLOR_TEXT_DIM);
         y += 20;
+        contentY += 20;
     } else {
         int idx = 0;
         for (int i = 0; i < plugins->count; i++) {
@@ -371,28 +475,33 @@ static void DrawSidebar(const PluginList *plugins, float deltaTime) {
                 bool isDragSource = g_drag.isDragging && strcmp(g_drag.pluginName, p->name) == 0;
                 DrawPluginItem(p, y, selected, isDragSource, COLOR_CONNECTED);
                 y += SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING;
+                contentY += SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING;
                 idx++;
             }
         }
     }
 
     y += SIDEBAR_SECTION_SPACING / 2;
+    contentY += SIDEBAR_SECTION_SPACING / 2;
 
     // =========== SECTION: LOCAL ONLY ===========
-    sectionStartY = y;
+    sectionStartY = contentY;
     sectionHeight = 24 + (localOnly > 0 ? localOnly * (SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING) : 20);
-    g_sectionRects[SECTION_LOCAL_ONLY] = (Rectangle){0, (float)sectionStartY, SIDEBAR_WIDTH, (float)sectionHeight};
-    if (mouseInSidebar && mouse.y >= sectionStartY && mouse.y < sectionStartY + sectionHeight) {
+    g_sectionRects[SECTION_LOCAL_ONLY] = (Rectangle){0, sectionStartY, SIDEBAR_WIDTH, (float)sectionHeight};
+
+    if (mouseInSidebar && adjustedMouseY >= sectionStartY && adjustedMouseY < sectionStartY + sectionHeight) {
         hoverSection = SECTION_LOCAL_ONLY;
     }
 
     isDropTarget = g_drag.isDragging && (g_drag.sourceSection == SECTION_SYNCED || g_drag.sourceSection == SECTION_DEVICE_ONLY) && mouseInSidebar;
     DrawSectionHeader("LOCAL ONLY", y, COLOR_EMBER, isDropTarget && hoverSection == SECTION_LOCAL_ONLY);
     y += 24;
+    contentY += 24;
 
     if (localOnly == 0) {
-        DrawTextEx(g_font, "(none)", (Vector2){SIDEBAR_PADDING, (float)y}, 12, 1, COLOR_TEXT_DIM);
+        DrawTextEx(g_font, "(none)", (Vector2){SIDEBAR_PADDING, y}, 12, 1, COLOR_TEXT_DIM);
         y += 20;
+        contentY += 20;
     } else {
         int idx = 0;
         for (int i = 0; i < plugins->count; i++) {
@@ -402,29 +511,58 @@ static void DrawSidebar(const PluginList *plugins, float deltaTime) {
                 bool isDragSource = g_drag.isDragging && strcmp(g_drag.pluginName, p->name) == 0;
                 DrawPluginItem(p, y, selected, isDragSource, COLOR_EMBER);
                 y += SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING;
+                contentY += SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING;
                 idx++;
             }
         }
     }
 
-    // Draw drop zone highlight when dragging
+    // Store total content height for scroll calculations
+    g_totalContentHeight = contentY + SIDEBAR_PADDING;
+
+    // Draw drop zone highlight
     if (g_drag.isDragging && mouseInSidebar) {
         Rectangle dropRect = g_sectionRects[hoverSection];
-        bool validDrop = false;
+        // Adjust to screen coordinates
+        dropRect.y = dropRect.y - g_scrollOffset + SIDEBAR_CONTENT_TOP;
 
-        // Validate drop: LOCAL -> DEVICE/SYNCED = install, DEVICE/SYNCED -> LOCAL = uninstall
+        bool validDrop = false;
         if (g_drag.sourceSection == SECTION_LOCAL_ONLY &&
             (hoverSection == SECTION_DEVICE_ONLY || hoverSection == SECTION_SYNCED)) {
-            validDrop = true;  // Install
+            validDrop = true;
         } else if ((g_drag.sourceSection == SECTION_SYNCED || g_drag.sourceSection == SECTION_DEVICE_ONLY) &&
                    hoverSection == SECTION_LOCAL_ONLY) {
-            validDrop = true;  // Uninstall
+            validDrop = true;
         }
 
         if (validDrop) {
             Color dropColor = ColorWithAlpha(COLOR_GOLD, 0.2f + sinf(g_animTime * 4.0f) * 0.1f);
             DrawRectangleRec(dropRect, dropColor);
             DrawRectangleLinesEx(dropRect, 2, ColorWithAlpha(COLOR_GOLD, 0.6f));
+        }
+    }
+
+    EndScissorMode();
+
+    // Draw scroll indicators
+    float maxScroll = g_totalContentHeight - SIDEBAR_CONTENT_HEIGHT;
+    if (maxScroll > 0) {
+        // Top fade if scrolled down
+        if (g_scrollOffset > 1.0f) {
+            for (int i = 0; i < 20; i++) {
+                float alpha = (20 - i) / 20.0f * 0.6f;
+                DrawRectangle(0, SIDEBAR_CONTENT_TOP + i, SIDEBAR_WIDTH - 1, 1,
+                              ColorWithAlpha(COLOR_WARM_GRAY, alpha));
+            }
+        }
+        // Bottom fade if more content below
+        if (g_scrollOffset < maxScroll - 1.0f) {
+            int bottomY = SIDEBAR_CONTENT_TOP + SIDEBAR_CONTENT_HEIGHT;
+            for (int i = 0; i < 20; i++) {
+                float alpha = i / 20.0f * 0.6f;
+                DrawRectangle(0, bottomY - 20 + i, SIDEBAR_WIDTH - 1, 1,
+                              ColorWithAlpha(COLOR_WARM_GRAY, alpha));
+            }
         }
     }
 }
@@ -434,7 +572,6 @@ static void DrawDragGhost(void) {
 
     Vector2 mouse = GetMousePosition();
 
-    // Draw ghost following cursor
     float ghostAlpha = 0.7f + sinf(g_animTime * 6.0f) * 0.2f;
     Rectangle ghostRect = {mouse.x + 10, mouse.y - 15, 150, 30};
 
@@ -445,14 +582,14 @@ static void DrawDragGhost(void) {
                (Vector2){ghostRect.x + 8, ghostRect.y + 7},
                14, 1, ColorWithAlpha(COLOR_TEXT_BRIGHT, ghostAlpha));
 
-    // Draw action hint
     const char *hint = NULL;
-    Vector2 mousePos = GetMousePosition();
-    bool inSidebar = mousePos.x < SIDEBAR_WIDTH;
+    bool inSidebar = mouse.x < SIDEBAR_WIDTH && mouse.y > HEADER_HEIGHT && mouse.y < WINDOW_HEIGHT - FOOTER_HEIGHT;
 
     if (inSidebar) {
+        float adjustedMouseY = mouse.y - SIDEBAR_CONTENT_TOP + g_scrollOffset;
         for (int i = 0; i < 3; i++) {
-            if (CheckCollisionPointRec(mousePos, g_sectionRects[i])) {
+            if (adjustedMouseY >= g_sectionRects[i].y &&
+                adjustedMouseY < g_sectionRects[i].y + g_sectionRects[i].height) {
                 if (g_drag.sourceSection == SECTION_LOCAL_ONLY && (i == SECTION_DEVICE_ONLY || i == SECTION_SYNCED)) {
                     hint = "Drop to INSTALL";
                 } else if ((g_drag.sourceSection == SECTION_SYNCED || g_drag.sourceSection == SECTION_DEVICE_ONLY) && i == SECTION_LOCAL_ONLY) {
@@ -490,11 +627,9 @@ static void DrawMainPanel(const PluginInfo *plugin) {
 
     int y = panelY + PANEL_PADDING;
 
-    // Plugin name
     DrawTextEx(g_font, plugin->displayName, (Vector2){panelX + PANEL_PADDING, (float)y}, 32, 2, COLOR_TEXT_BRIGHT);
     y += 48;
 
-    // Underline
     float pulse = (sinf(g_animTime * 2.0f) + 1.0f) * 0.5f;
     Color lineColor = ColorWithAlpha(COLOR_FIRE_DEEP, 0.4f + pulse * 0.3f);
     DrawRectangle(panelX + PANEL_PADDING, y, 200, 2, lineColor);
@@ -503,7 +638,6 @@ static void DrawMainPanel(const PluginInfo *plugin) {
     DrawTextEx(g_font, "llizardgui plugin", (Vector2){panelX + PANEL_PADDING, (float)y}, 16, 1, COLOR_TEXT_DIM);
     y += 30;
 
-    // File sizes
     char sizeStr[64];
     if (plugin->localSize > 0) {
         FormatFileSize(plugin->localSize, sizeStr, sizeof(sizeStr));
@@ -523,7 +657,6 @@ static void DrawMainPanel(const PluginInfo *plugin) {
 
     y += 10;
 
-    // Status
     const char *statusText;
     Color statusColor;
     switch (plugin->status) {
@@ -545,7 +678,6 @@ static void DrawMainPanel(const PluginInfo *plugin) {
     DrawTextEx(g_font, statusText, (Vector2){panelX + PANEL_PADDING + 70, (float)y}, 16, 1, statusColor);
     y += 50;
 
-    // Action buttons
     bool canInstall = (plugin->localPath[0] != '\0' && plugin->remotePath[0] == '\0' && SshGetStatus() == SSH_STATUS_CONNECTED);
     bool canUninstall = (plugin->remotePath[0] != '\0' && SshGetStatus() == SSH_STATUS_CONNECTED);
     bool isBusy = PluginBrowserIsBusy();
@@ -553,7 +685,6 @@ static void DrawMainPanel(const PluginInfo *plugin) {
     Rectangle installBtn = {panelX + PANEL_PADDING, (float)y, BUTTON_WIDTH, BUTTON_HEIGHT};
     Rectangle uninstallBtn = {panelX + PANEL_PADDING + BUTTON_WIDTH + BUTTON_SPACING, (float)y, BUTTON_WIDTH, BUTTON_HEIGHT};
 
-    // Install button
     Color installBg = (canInstall && !isBusy) ? COLOR_FIRE_DEEP : ColorWithAlpha(COLOR_FIRE_DEEP, 0.3f);
     Color installText = (canInstall && !isBusy) ? COLOR_TEXT_BRIGHT : COLOR_TEXT_DIM;
     DrawRectangleRounded(installBtn, BUTTON_RADIUS, 4, installBg);
@@ -563,7 +694,6 @@ static void DrawMainPanel(const PluginInfo *plugin) {
                          installBtn.y + (installBtn.height - 16) / 2},
                16, 1, installText);
 
-    // Uninstall button
     Color uninstallBg = (canUninstall && !isBusy) ? COLOR_ASH : ColorWithAlpha(COLOR_ASH, 0.3f);
     Color uninstallText = (canUninstall && !isBusy) ? COLOR_TEXT_WARM : COLOR_TEXT_DIM;
     DrawRectangleRounded(uninstallBtn, BUTTON_RADIUS, 4, uninstallBg);
@@ -575,7 +705,6 @@ static void DrawMainPanel(const PluginInfo *plugin) {
 
     y += BUTTON_HEIGHT + 30;
 
-    // Progress bar
     const PluginOpState *opState = PluginBrowserGetOpState();
     if (opState->operation != OP_NONE || (opState->complete && g_animTime < 3.0f)) {
         Rectangle progressBounds = {panelX + PANEL_PADDING, (float)y, panelW - PANEL_PADDING * 2, PROGRESS_HEIGHT};
@@ -611,7 +740,7 @@ static void DrawFooter(void) {
     DrawRectangle(0, footerY, WINDOW_WIDTH, FOOTER_HEIGHT, COLOR_WARM_GRAY);
     DrawRectangle(0, footerY, WINDOW_WIDTH, 1, ColorWithAlpha(COLOR_FIRE_DEEP, 0.3f));
 
-    const char *instructions = "Drag to install/uninstall  |  Arrow keys: Navigate  |  Tab: Switch section  |  R: Refresh";
+    const char *instructions = "Drag to install/uninstall  |  Scroll: Mouse wheel  |  Tab: Switch section  |  R: Refresh";
     DrawTextEx(g_font, instructions,
                (Vector2){HEADER_PADDING, footerY + (FOOTER_HEIGHT - 14) / 2.0f},
                14, 1, COLOR_TEXT_DIM);
@@ -624,27 +753,40 @@ static void DrawFooter(void) {
 static void HandleInput(const PluginList *plugins) {
     Vector2 mouse = GetMousePosition();
     bool isBusy = PluginBrowserIsBusy();
+    bool mouseInSidebar = (mouse.x < SIDEBAR_WIDTH && mouse.y > HEADER_HEIGHT && mouse.y < WINDOW_HEIGHT - FOOTER_HEIGHT);
 
-    int deviceOnly, synced, localOnly;
-    GetSectionCounts(plugins, &deviceOnly, &synced, &localOnly);
+    // Mouse wheel scrolling
+    float wheel = GetMouseWheelMove();
+    if (wheel != 0 && mouseInSidebar) {
+        float scrollAmount = 40.0f;
+        g_targetScroll -= wheel * scrollAmount;
+
+        // Clamp
+        float maxScroll = g_totalContentHeight - SIDEBAR_CONTENT_HEIGHT;
+        if (maxScroll < 0) maxScroll = 0;
+        if (g_targetScroll < 0) g_targetScroll = 0;
+        if (g_targetScroll > maxScroll) g_targetScroll = maxScroll;
+    }
 
     // Keyboard navigation
     if (IsKeyPressed(KEY_TAB)) {
-        // Cycle through sections
         int tries = 3;
         do {
             g_selection.section = (g_selection.section + 1) % 3;
             g_selection.index = 0;
             tries--;
         } while (GetSectionCount(plugins, g_selection.section) == 0 && tries > 0);
+        ScrollToSelection(plugins);
     }
 
     int currentCount = GetSectionCount(plugins, g_selection.section);
     if (IsKeyPressed(KEY_DOWN) && currentCount > 0) {
         g_selection.index = (g_selection.index + 1) % currentCount;
+        ScrollToSelection(plugins);
     }
     if (IsKeyPressed(KEY_UP) && currentCount > 0) {
         g_selection.index = (g_selection.index - 1 + currentCount) % currentCount;
+        ScrollToSelection(plugins);
     }
 
     // Refresh
@@ -668,18 +810,24 @@ static void HandleInput(const PluginList *plugins) {
         }
     }
 
-    // Mouse click selection
-    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && mouse.x < SIDEBAR_WIDTH && !isBusy) {
-        // Check which section and item was clicked
+    // Mouse click selection in sidebar
+    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && mouseInSidebar && !isBusy) {
+        float adjustedMouseY = mouse.y - SIDEBAR_CONTENT_TOP + g_scrollOffset;
+
         for (int section = 0; section < 3; section++) {
-            if (CheckCollisionPointRec(mouse, g_sectionRects[section])) {
-                int itemY = (int)g_sectionRects[section].y + 24;  // After header
+            Rectangle sectionRect = g_sectionRects[section];
+            if (adjustedMouseY >= sectionRect.y && adjustedMouseY < sectionRect.y + sectionRect.height) {
+                // Click is in this section, find which item
+                float itemY = sectionRect.y + 24;  // After section header
                 int count = GetSectionCount(plugins, section);
 
+                // Skip "(none)" text if empty
+                if (count == 0) break;
+
                 for (int i = 0; i < count; i++) {
-                    Rectangle itemRect = {SIDEBAR_PADDING - 4, (float)itemY,
-                                          SIDEBAR_WIDTH - SIDEBAR_PADDING * 2 + 8, SIDEBAR_ITEM_HEIGHT};
-                    if (CheckCollisionPointRec(mouse, itemRect)) {
+                    float itemTop = itemY;
+                    float itemBottom = itemY + SIDEBAR_ITEM_HEIGHT;
+                    if (adjustedMouseY >= itemTop && adjustedMouseY < itemBottom) {
                         g_selection.section = section;
                         g_selection.index = i;
 
@@ -701,7 +849,7 @@ static void HandleInput(const PluginList *plugins) {
         }
     }
 
-    // Mouse button click on main panel buttons
+    // Mouse click on main panel buttons
     if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && selectedPlugin && !isBusy && mouse.x >= PANEL_START_X) {
         int panelX = PANEL_START_X;
         int buttonY = HEADER_HEIGHT + PANEL_PADDING + 48 + 20 + 30 + 24 + 24 + 10 + 50;
@@ -723,12 +871,11 @@ static void HandleInput(const PluginList *plugins) {
         }
     }
 
-    // Update drag
+    // Update drag state
     if (g_drag.isDragging) {
         g_drag.currentPos = mouse;
         g_drag.dragTime += GetFrameTime();
 
-        // Cancel if moved too little (was just a click)
         float dragDist = sqrtf(powf(mouse.x - g_drag.startPos.x, 2) + powf(mouse.y - g_drag.startPos.y, 2));
         if (dragDist < 5 && g_drag.dragTime < 0.15f && IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) {
             g_drag.isDragging = false;
@@ -736,19 +883,19 @@ static void HandleInput(const PluginList *plugins) {
 
         // Handle drop
         if (IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) {
-            if (mouse.x < SIDEBAR_WIDTH && !isBusy && SshGetStatus() == SSH_STATUS_CONNECTED) {
+            if (mouseInSidebar && !isBusy && SshGetStatus() == SSH_STATUS_CONNECTED) {
+                float adjustedMouseY = mouse.y - SIDEBAR_CONTENT_TOP + g_scrollOffset;
+
                 for (int section = 0; section < 3; section++) {
-                    if (CheckCollisionPointRec(mouse, g_sectionRects[section])) {
-                        // Validate and perform action
+                    Rectangle sectionRect = g_sectionRects[section];
+                    if (adjustedMouseY >= sectionRect.y && adjustedMouseY < sectionRect.y + sectionRect.height) {
                         if (g_drag.sourceSection == SECTION_LOCAL_ONLY &&
                             (section == SECTION_DEVICE_ONLY || section == SECTION_SYNCED)) {
-                            // Install
                             printf("Salamander: Installing %s (dragged to device)\n", g_drag.pluginName);
                             PluginBrowserInstall(g_drag.pluginName);
                             g_needsRefresh = true;
                         } else if ((g_drag.sourceSection == SECTION_SYNCED || g_drag.sourceSection == SECTION_DEVICE_ONLY) &&
                                    section == SECTION_LOCAL_ONLY) {
-                            // Uninstall
                             printf("Salamander: Uninstalling %s (dragged to local)\n", g_drag.pluginName);
                             PluginBrowserUninstall(g_drag.pluginName);
                             g_needsRefresh = true;
@@ -757,7 +904,6 @@ static void HandleInput(const PluginList *plugins) {
                     }
                 }
             }
-
             g_drag.isDragging = false;
         }
     }
@@ -795,6 +941,9 @@ int main(int argc, char *argv[]) {
         float deltaTime = GetFrameTime();
         g_animTime += deltaTime;
 
+        // Update smooth scroll
+        UpdateScroll(deltaTime);
+
         // Periodic connection check
         g_connectionCheckTimer += deltaTime;
         if (g_connectionCheckTimer >= 5.0f) {
@@ -807,7 +956,6 @@ int main(int argc, char *argv[]) {
             PluginBrowserRefresh();
             g_needsRefresh = false;
 
-            // Reset selection if invalid
             int count = GetSectionCount(PluginBrowserGetList(), g_selection.section);
             if (g_selection.index >= count) {
                 g_selection.index = count > 0 ? count - 1 : 0;
