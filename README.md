@@ -102,5 +102,5 @@ Fire salamander palette:
 
 ### Install fails
 1. Check device has space: `ssh root@172.16.42.2 'df -h'`
-2. Ensure `/tmp/plugins` directory exists
+2. Ensure `/usr/lib/llizard/plugins` directory exists
 3. Check for permission errors in terminal output
