@@ -1,0 +1,18 @@
+# Build directories
+build/
+build-*/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Compiled objects
+*.o
+*.so
+*.a
+
+# Executables
+salamander
