@@ -63,6 +63,48 @@ static int g_hoverIndex = -1;  // -1 means no hover
 static Rectangle g_installBtn = {0};
 static Rectangle g_uninstallBtn = {0};
 
+// Button press animation state
+static float g_installBtnPress = 0.0f;   // 0 = normal, 1 = fully pressed
+static float g_uninstallBtnPress = 0.0f;
+
+// Toast notification system
+typedef struct {
+    char message[128];
+    bool isSuccess;
+    float timer;        // Counts down from TOAST_DURATION
+    float slideIn;      // Animation 0->1
+    bool active;
+} Toast;
+
+#define TOAST_DURATION 3.0f
+#define TOAST_SLIDE_SPEED 8.0f
+static Toast g_toast = {0};
+
+// Salamander success messages
+static const char *g_successMessages[] = {
+    "Toasty! %s installed",
+    "Fired up! %s is ready",
+    "Blazing! %s deployed",
+    "Sizzling! %s complete",
+    "Hot stuff! %s installed",
+};
+static const int g_successMessageCount = 5;
+
+// Salamander failure messages
+static const char *g_failMessages[] = {
+    "Fizzled! %s failed",
+    "Extinguished! %s error",
+    "Cooled off! %s failed",
+    "Smoke out! %s error",
+};
+static const int g_failMessageCount = 4;
+
+// Last operation tracking for toast display
+static bool g_lastOpComplete = true;
+static bool g_lastOpSuccess = false;
+static char g_lastOpPlugin[64] = {0};
+static PluginOperation g_lastOpType = OP_NONE;
+
 // Font
 static Font g_font;
 static bool g_fontLoaded = false;
@@ -78,6 +120,10 @@ static void DrawMainPanel(const PluginInfo *selectedPlugin);
 static void DrawFooter(void);
 static void DrawProgressBar(Rectangle bounds, float progress, const char *label);
 static void DrawDragGhost(void);
+static void DrawToast(void);
+static void ShowToast(const char *pluginName, bool isSuccess, bool isInstall);
+static void UpdateToast(float deltaTime);
+static void UpdateButtonAnimations(float deltaTime);
 static void HandleInput(const PluginList *plugins);
 static void UpdateScroll(float deltaTime);
 static void ScrollToSelection(const PluginList *plugins);
@@ -293,6 +339,127 @@ static void ScrollToSelection(const PluginList *plugins) {
     // Clamp
     if (g_targetScroll < 0) g_targetScroll = 0;
     if (g_targetScroll > maxScroll) g_targetScroll = maxScroll;
+}
+
+// ============================================================================
+// Toast Notifications & Button Animations
+// ============================================================================
+
+static void ShowToast(const char *pluginName, bool isSuccess, bool isInstall) {
+    g_toast.active = true;
+    g_toast.isSuccess = isSuccess;
+    g_toast.timer = TOAST_DURATION;
+    g_toast.slideIn = 0.0f;
+
+    // Pick a random fun message
+    if (isSuccess) {
+        int idx = GetRandomValue(0, g_successMessageCount - 1);
+        if (isInstall) {
+            snprintf(g_toast.message, sizeof(g_toast.message), g_successMessages[idx], pluginName);
+        } else {
+            // Uninstall success messages
+            const char *uninstallMsgs[] = {
+                "Cooled down! %s removed",
+                "Ashes cleared! %s gone",
+                "Extinguished! %s removed",
+            };
+            snprintf(g_toast.message, sizeof(g_toast.message), uninstallMsgs[idx % 3], pluginName);
+        }
+    } else {
+        int idx = GetRandomValue(0, g_failMessageCount - 1);
+        snprintf(g_toast.message, sizeof(g_toast.message), g_failMessages[idx], pluginName);
+    }
+}
+
+static void UpdateToast(float deltaTime) {
+    if (!g_toast.active) return;
+
+    // Slide in animation
+    if (g_toast.slideIn < 1.0f) {
+        g_toast.slideIn += deltaTime * TOAST_SLIDE_SPEED;
+        if (g_toast.slideIn > 1.0f) g_toast.slideIn = 1.0f;
+    }
+
+    // Count down timer
+    g_toast.timer -= deltaTime;
+
+    // Slide out when timer runs low
+    if (g_toast.timer <= 0.5f) {
+        g_toast.slideIn = g_toast.timer / 0.5f;
+    }
+
+    if (g_toast.timer <= 0.0f) {
+        g_toast.active = false;
+    }
+}
+
+static void UpdateButtonAnimations(float deltaTime) {
+    // Decay button press animations
+    float decaySpeed = 8.0f;
+    if (g_installBtnPress > 0.0f) {
+        g_installBtnPress -= deltaTime * decaySpeed;
+        if (g_installBtnPress < 0.0f) g_installBtnPress = 0.0f;
+    }
+    if (g_uninstallBtnPress > 0.0f) {
+        g_uninstallBtnPress -= deltaTime * decaySpeed;
+        if (g_uninstallBtnPress < 0.0f) g_uninstallBtnPress = 0.0f;
+    }
+}
+
+static void DrawToast(void) {
+    if (!g_toast.active) return;
+
+    // Calculate toast position (slides in from right)
+    float toastWidth = 320;
+    float toastHeight = 60;
+    float padding = 20;
+
+    // Ease out cubic for smooth slide
+    float ease = 1.0f - powf(1.0f - g_toast.slideIn, 3.0f);
+    float xOffset = (1.0f - ease) * (toastWidth + padding);
+
+    float x = WINDOW_WIDTH - toastWidth - padding + xOffset;
+    float y = HEADER_HEIGHT + padding;
+
+    Rectangle toastRect = {x, y, toastWidth, toastHeight};
+
+    // Background with glow
+    Color bgColor = g_toast.isSuccess ? (Color){30, 60, 30, 240} : (Color){60, 30, 30, 240};
+    Color glowColor = g_toast.isSuccess ? COLOR_CONNECTED : COLOR_DISCONNECTED;
+    Color borderColor = g_toast.isSuccess ? COLOR_CONNECTED : COLOR_DISCONNECTED;
+
+    // Glow effect
+    float glowPulse = (sinf(g_animTime * 4.0f) + 1.0f) * 0.5f;
+    for (int i = 8; i > 0; i--) {
+        float alpha = (8 - i) / 8.0f * 0.15f * (0.7f + glowPulse * 0.3f);
+        Rectangle glowRect = {toastRect.x - i, toastRect.y - i, toastRect.width + i*2, toastRect.height + i*2};
+        DrawRectangleRounded(glowRect, 0.3f, 4, ColorWithAlpha(glowColor, alpha));
+    }
+
+    // Main toast body
+    DrawRectangleRounded(toastRect, 0.3f, 4, bgColor);
+    DrawRectangleRoundedLines(toastRect, 0.3f, 4, borderColor);
+
+    // Icon
+    float iconX = x + 16;
+    float iconY = y + toastHeight / 2;
+    if (g_toast.isSuccess) {
+        // Checkmark / flame icon
+        DrawCircle((int)iconX, (int)iconY, 12, ColorWithAlpha(COLOR_CONNECTED, 0.3f));
+        DrawTextEx(g_font, "*", (Vector2){iconX - 6, iconY - 10}, 24, 1, COLOR_GOLD);
+    } else {
+        // X / error icon
+        DrawCircle((int)iconX, (int)iconY, 12, ColorWithAlpha(COLOR_DISCONNECTED, 0.3f));
+        DrawTextEx(g_font, "X", (Vector2){iconX - 6, iconY - 10}, 20, 1, COLOR_DISCONNECTED);
+    }
+
+    // Message text
+    Color textColor = g_toast.isSuccess ? COLOR_CONNECTED : (Color){255, 180, 180, 255};
+    DrawTextEx(g_font, g_toast.message, (Vector2){x + 40, y + 12}, 16, 1, textColor);
+
+    // Subtitle
+    const char *subtitle = g_toast.isSuccess ? "Operation complete" : "Please try again";
+    DrawTextEx(g_font, subtitle, (Vector2){x + 40, y + 34}, 12, 1, COLOR_TEXT_DIM);
 }
 
 // ============================================================================
@@ -743,41 +910,93 @@ static void DrawMainPanel(const PluginInfo *plugin) {
     bool installHovered = CheckCollisionPointRec(mouse, g_installBtn) && canInstall && !isBusy;
     bool uninstallHovered = CheckCollisionPointRec(mouse, g_uninstallBtn) && canUninstall && !isBusy;
 
-    // Install button
+    // Install button with press animation
+    float installPress = g_installBtnPress;
+    float installScale = 1.0f - installPress * 0.05f;  // Shrink slightly when pressed
+    float installOffsetY = installPress * 2.0f;        // Move down when pressed
+
+    Rectangle installDrawRect = {
+        g_installBtn.x + (g_installBtn.width * (1.0f - installScale)) / 2,
+        g_installBtn.y + installOffsetY + (g_installBtn.height * (1.0f - installScale)) / 2,
+        g_installBtn.width * installScale,
+        g_installBtn.height * installScale
+    };
+
     Color installBg;
     if (canInstall && !isBusy) {
-        installBg = installHovered ? COLOR_FLAME_ORANGE : COLOR_FIRE_DEEP;
+        if (installPress > 0.1f) {
+            installBg = COLOR_GOLD;  // Flash gold when pressed
+        } else {
+            installBg = installHovered ? COLOR_FLAME_ORANGE : COLOR_FIRE_DEEP;
+        }
     } else {
         installBg = ColorWithAlpha(COLOR_FIRE_DEEP, 0.3f);
     }
-    Color installText = (canInstall && !isBusy) ? COLOR_TEXT_BRIGHT : COLOR_TEXT_DIM;
-    DrawRectangleRounded(g_installBtn, BUTTON_RADIUS, 4, installBg);
-    if (installHovered) {
-        DrawRectangleRoundedLines(g_installBtn, BUTTON_RADIUS, 4, ColorWithAlpha(COLOR_GOLD, 0.8f));
+    Color installTextColor = (canInstall && !isBusy) ? COLOR_TEXT_BRIGHT : COLOR_TEXT_DIM;
+
+    // Glow effect when pressed
+    if (installPress > 0.1f) {
+        for (int i = 6; i > 0; i--) {
+            float alpha = (6 - i) / 6.0f * 0.3f * installPress;
+            Rectangle glowRect = {installDrawRect.x - i*2, installDrawRect.y - i*2,
+                                  installDrawRect.width + i*4, installDrawRect.height + i*4};
+            DrawRectangleRounded(glowRect, BUTTON_RADIUS, 4, ColorWithAlpha(COLOR_GOLD, alpha));
+        }
+    }
+
+    DrawRectangleRounded(installDrawRect, BUTTON_RADIUS, 4, installBg);
+    if (installHovered && installPress < 0.1f) {
+        DrawRectangleRoundedLines(installDrawRect, BUTTON_RADIUS, 4, ColorWithAlpha(COLOR_GOLD, 0.8f));
     }
     Vector2 installSize = MeasureTextEx(g_font, "INSTALL", 16, 1);
     DrawTextEx(g_font, "INSTALL",
-               (Vector2){g_installBtn.x + (g_installBtn.width - installSize.x) / 2,
-                         g_installBtn.y + (g_installBtn.height - 16) / 2},
-               16, 1, installText);
+               (Vector2){installDrawRect.x + (installDrawRect.width - installSize.x) / 2,
+                         installDrawRect.y + (installDrawRect.height - 16) / 2},
+               16, 1, installTextColor);
 
-    // Uninstall button
+    // Uninstall button with press animation
+    float uninstallPress = g_uninstallBtnPress;
+    float uninstallScale = 1.0f - uninstallPress * 0.05f;
+    float uninstallOffsetY = uninstallPress * 2.0f;
+
+    Rectangle uninstallDrawRect = {
+        g_uninstallBtn.x + (g_uninstallBtn.width * (1.0f - uninstallScale)) / 2,
+        g_uninstallBtn.y + uninstallOffsetY + (g_uninstallBtn.height * (1.0f - uninstallScale)) / 2,
+        g_uninstallBtn.width * uninstallScale,
+        g_uninstallBtn.height * uninstallScale
+    };
+
     Color uninstallBg;
     if (canUninstall && !isBusy) {
-        uninstallBg = uninstallHovered ? ColorWithAlpha(COLOR_ASH, 1.2f) : COLOR_ASH;
+        if (uninstallPress > 0.1f) {
+            uninstallBg = COLOR_DISCONNECTED;  // Flash red when pressed
+        } else {
+            uninstallBg = uninstallHovered ? (Color){74, 64, 68, 255} : COLOR_ASH;
+        }
     } else {
         uninstallBg = ColorWithAlpha(COLOR_ASH, 0.3f);
     }
-    Color uninstallText = (canUninstall && !isBusy) ? COLOR_TEXT_WARM : COLOR_TEXT_DIM;
-    DrawRectangleRounded(g_uninstallBtn, BUTTON_RADIUS, 4, uninstallBg);
-    if (uninstallHovered) {
-        DrawRectangleRoundedLines(g_uninstallBtn, BUTTON_RADIUS, 4, ColorWithAlpha(COLOR_DISCONNECTED, 0.8f));
+    Color uninstallTextColor = (canUninstall && !isBusy) ? COLOR_TEXT_WARM : COLOR_TEXT_DIM;
+
+    // Glow effect when pressed
+    if (uninstallPress > 0.1f) {
+        for (int i = 6; i > 0; i--) {
+            float alpha = (6 - i) / 6.0f * 0.3f * uninstallPress;
+            Rectangle glowRect = {uninstallDrawRect.x - i*2, uninstallDrawRect.y - i*2,
+                                  uninstallDrawRect.width + i*4, uninstallDrawRect.height + i*4};
+            DrawRectangleRounded(glowRect, BUTTON_RADIUS, 4, ColorWithAlpha(COLOR_DISCONNECTED, alpha));
+        }
+    }
+
+    DrawRectangleRounded(uninstallDrawRect, BUTTON_RADIUS, 4, uninstallBg);
+    if (uninstallHovered && uninstallPress < 0.1f) {
+        DrawRectangleRoundedLines(uninstallDrawRect, BUTTON_RADIUS, 4, ColorWithAlpha(COLOR_DISCONNECTED, 0.8f));
     }
     Vector2 uninstallSize = MeasureTextEx(g_font, "UNINSTALL", 16, 1);
     DrawTextEx(g_font, "UNINSTALL",
-               (Vector2){g_uninstallBtn.x + (g_uninstallBtn.width - uninstallSize.x) / 2,
-                         g_uninstallBtn.y + (g_uninstallBtn.height - 16) / 2},
-               16, 1, uninstallText);
+               (Vector2){uninstallDrawRect.x + (uninstallDrawRect.width - uninstallSize.x) / 2,
+                         uninstallDrawRect.y + (uninstallDrawRect.height - 16) / 2},
+               16, 1, uninstallTextColor);
 
     y += BUTTON_HEIGHT + 30;
 
@@ -875,12 +1094,20 @@ static void HandleInput(const PluginList *plugins) {
     if (IsKeyPressed(KEY_ENTER) && selectedPlugin && !isBusy) {
         if (selectedPlugin->localPath[0] != '\0' && selectedPlugin->remotePath[0] == '\0' &&
             SshGetStatus() == SSH_STATUS_CONNECTED) {
+            g_installBtnPress = 1.0f;
+            strncpy(g_lastOpPlugin, selectedPlugin->name, sizeof(g_lastOpPlugin) - 1);
+            g_lastOpType = OP_INSTALLING;
+            g_lastOpComplete = false;
             PluginBrowserInstall(selectedPlugin->name);
             g_needsRefresh = true;
         }
     }
     if ((IsKeyPressed(KEY_DELETE) || IsKeyPressed(KEY_BACKSPACE)) && selectedPlugin && !isBusy) {
         if (selectedPlugin->remotePath[0] != '\0' && SshGetStatus() == SSH_STATUS_CONNECTED) {
+            g_uninstallBtnPress = 1.0f;
+            strncpy(g_lastOpPlugin, selectedPlugin->name, sizeof(g_lastOpPlugin) - 1);
+            g_lastOpType = OP_UNINSTALLING;
+            g_lastOpComplete = false;
             PluginBrowserUninstall(selectedPlugin->name);
             g_needsRefresh = true;
         }
@@ -931,12 +1158,20 @@ static void HandleInput(const PluginList *plugins) {
             if (selectedPlugin->localPath[0] != '\0' && selectedPlugin->remotePath[0] == '\0' &&
                 SshGetStatus() == SSH_STATUS_CONNECTED) {
                 printf("Salamander: Installing %s (button click)\n", selectedPlugin->name);
+                g_installBtnPress = 1.0f;  // Trigger press animation
+                strncpy(g_lastOpPlugin, selectedPlugin->name, sizeof(g_lastOpPlugin) - 1);
+                g_lastOpType = OP_INSTALLING;
+                g_lastOpComplete = false;
                 PluginBrowserInstall(selectedPlugin->name);
                 g_needsRefresh = true;
             }
         } else if (CheckCollisionPointRec(mouse, g_uninstallBtn)) {
             if (selectedPlugin->remotePath[0] != '\0' && SshGetStatus() == SSH_STATUS_CONNECTED) {
                 printf("Salamander: Uninstalling %s (button click)\n", selectedPlugin->name);
+                g_uninstallBtnPress = 1.0f;  // Trigger press animation
+                strncpy(g_lastOpPlugin, selectedPlugin->name, sizeof(g_lastOpPlugin) - 1);
+                g_lastOpType = OP_UNINSTALLING;
+                g_lastOpComplete = false;
                 PluginBrowserUninstall(selectedPlugin->name);
                 g_needsRefresh = true;
             }
@@ -964,11 +1199,19 @@ static void HandleInput(const PluginList *plugins) {
                         if (g_drag.sourceSection == SECTION_LOCAL_ONLY &&
                             (section == SECTION_DEVICE_ONLY || section == SECTION_SYNCED)) {
                             printf("Salamander: Installing %s (dragged to device)\n", g_drag.pluginName);
+                            g_installBtnPress = 1.0f;
+                            strncpy(g_lastOpPlugin, g_drag.pluginName, sizeof(g_lastOpPlugin) - 1);
+                            g_lastOpType = OP_INSTALLING;
+                            g_lastOpComplete = false;
                             PluginBrowserInstall(g_drag.pluginName);
                             g_needsRefresh = true;
                         } else if ((g_drag.sourceSection == SECTION_SYNCED || g_drag.sourceSection == SECTION_DEVICE_ONLY) &&
                                    section == SECTION_LOCAL_ONLY) {
                             printf("Salamander: Uninstalling %s (dragged to local)\n", g_drag.pluginName);
+                            g_uninstallBtnPress = 1.0f;
+                            strncpy(g_lastOpPlugin, g_drag.pluginName, sizeof(g_lastOpPlugin) - 1);
+                            g_lastOpType = OP_UNINSTALLING;
+                            g_lastOpComplete = false;
                             PluginBrowserUninstall(g_drag.pluginName);
                             g_needsRefresh = true;
                         }
@@ -1013,8 +1256,18 @@ int main(int argc, char *argv[]) {
         float deltaTime = GetFrameTime();
         g_animTime += deltaTime;
 
-        // Update smooth scroll
+        // Update animations
         UpdateScroll(deltaTime);
+        UpdateButtonAnimations(deltaTime);
+        UpdateToast(deltaTime);
+
+        // Check for operation completion and show toast
+        const PluginOpState *opState = PluginBrowserGetOpState();
+        if (!g_lastOpComplete && opState->complete && g_lastOpPlugin[0] != '\0') {
+            g_lastOpComplete = true;
+            g_lastOpSuccess = opState->success;
+            ShowToast(g_lastOpPlugin, opState->success, g_lastOpType == OP_INSTALLING);
+        }
 
         // Periodic connection check
         g_connectionCheckTimer += deltaTime;
@@ -1049,6 +1302,7 @@ int main(int argc, char *argv[]) {
         DrawMainPanel(selectedPlugin);
         DrawFooter();
         DrawDragGhost();
+        DrawToast();
 
         EndDrawing();
     }
