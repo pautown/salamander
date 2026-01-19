@@ -1,5 +1,7 @@
 # Salamander - Plugin Manager for CarThing
 
+![Salamander](salamander.jpg)
+
 A desktop raylib application for installing and uninstalling llizardgui-host plugins on a CarThing device, featuring a fire salamander visual theme.
 
 ## Features
