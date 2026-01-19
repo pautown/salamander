@@ -260,23 +260,46 @@ bool PluginBrowserInstall(const char *pluginName) {
     strncpy(g_opState.pluginName, pluginName, sizeof(g_opState.pluginName) - 1);
     snprintf(g_opState.message, sizeof(g_opState.message), "Installing %s...", pluginName);
 
-    // Ensure remote directory exists
+    // Step 1: Enable read-write mode
+    printf("Install: Enabling read-write mode...\n");
+    g_opState.progress = 0.1f;
+    snprintf(g_opState.message, sizeof(g_opState.message), "Enabling write mode...");
+    SshResult rwResult = SshExecute("mount -o remount,rw /");
+    if (!rwResult.success) {
+        printf("Install: Warning - could not remount rw: %s\n", rwResult.output);
+    }
+
+    // Step 2: Ensure remote directory exists
+    printf("Install: Creating plugin directory...\n");
+    g_opState.progress = 0.2f;
+    snprintf(g_opState.message, sizeof(g_opState.message), "Creating directory...");
     SshExecute("mkdir -p " SSH_PLUGIN_PATH);
 
-    // Build remote path
+    // Step 3: Build remote path and copy file
     char remotePath[512];
     snprintf(remotePath, sizeof(remotePath), "%s/%s.so", SSH_PLUGIN_PATH, pluginName);
 
-    // Copy file
+    printf("Install: Copying %s to %s...\n", plugin->localPath, remotePath);
     bool success = SshCopyToDevice(plugin->localPath, remotePath,
                                    InstallProgressCallback, NULL);
+
+    // Step 4: Sync filesystem
+    if (success) {
+        printf("Install: Syncing filesystem...\n");
+        g_opState.progress = 0.95f;
+        snprintf(g_opState.message, sizeof(g_opState.message), "Syncing...");
+        SshExecute("sync");
+    }
 
     g_opState.complete = true;
     g_opState.success = success;
     g_opState.operation = OP_NONE;
 
     if (success) {
+        printf("Install: Successfully installed %s\n", pluginName);
         snprintf(g_opState.message, sizeof(g_opState.message), "Installed %s", pluginName);
+    } else {
+        printf("Install: Failed to install %s\n", pluginName);
     }
 
     return success;
@@ -295,12 +318,66 @@ bool PluginBrowserUninstall(const char *pluginName) {
     }
 
     g_opState.operation = OP_UNINSTALLING;
-    g_opState.progress = 0.5f;
+    g_opState.progress = 0.0f;
     g_opState.complete = false;
     strncpy(g_opState.pluginName, pluginName, sizeof(g_opState.pluginName) - 1);
     snprintf(g_opState.message, sizeof(g_opState.message), "Uninstalling %s...", pluginName);
 
-    bool success = SshDeleteFile(plugin->remotePath);
+    // Step 1: Enable read-write mode
+    printf("Uninstall: Enabling read-write mode...\n");
+    g_opState.progress = 0.1f;
+    snprintf(g_opState.message, sizeof(g_opState.message), "Enabling write mode...");
+    SshResult rwResult = SshExecute("mount -o remount,rw /");
+    if (!rwResult.success) {
+        printf("Uninstall: Warning - could not remount rw: %s\n", rwResult.output);
+    }
+
+    // Step 2: Stop llizardgui service if running (to release any file handles)
+    printf("Uninstall: Stopping llizardgui service...\n");
+    g_opState.progress = 0.2f;
+    snprintf(g_opState.message, sizeof(g_opState.message), "Stopping service...");
+    SshExecute("sv stop llizardgui 2>/dev/null || true");
+    // Also try killing the process directly in case it's not running as a service
+    SshExecute("pkill -f llizardgui-host 2>/dev/null || true");
+
+    // Step 3: Delete the plugin file
+    printf("Uninstall: Deleting plugin file: %s\n", plugin->remotePath);
+    g_opState.progress = 0.4f;
+    snprintf(g_opState.message, sizeof(g_opState.message), "Deleting plugin...");
+
+    char deleteCmd[1024];
+    snprintf(deleteCmd, sizeof(deleteCmd), "rm -f '%s'", plugin->remotePath);
+    SshResult deleteResult = SshExecute(deleteCmd);
+    printf("Uninstall: Delete result: success=%d, output=%s\n", deleteResult.success, deleteResult.output);
+
+    // Step 4: Delete any related config/data files for this plugin
+    printf("Uninstall: Cleaning up related files for %s...\n", pluginName);
+    g_opState.progress = 0.6f;
+    snprintf(g_opState.message, sizeof(g_opState.message), "Cleaning up...");
+
+    // Delete plugin config directory if it exists
+    char cleanupCmd[1024];
+    snprintf(cleanupCmd, sizeof(cleanupCmd),
+             "rm -rf /var/lib/llizard/plugins/%s 2>/dev/null || true; "
+             "rm -rf /tmp/llizard/%s 2>/dev/null || true; "
+             "rm -f /etc/llizard/plugins/%s.conf 2>/dev/null || true",
+             pluginName, pluginName, pluginName);
+    SshExecute(cleanupCmd);
+
+    // Step 5: Sync filesystem
+    printf("Uninstall: Syncing filesystem...\n");
+    g_opState.progress = 0.8f;
+    snprintf(g_opState.message, sizeof(g_opState.message), "Syncing...");
+    SshExecute("sync");
+
+    // Step 6: Restart llizardgui service
+    printf("Uninstall: Restarting llizardgui service...\n");
+    g_opState.progress = 0.9f;
+    snprintf(g_opState.message, sizeof(g_opState.message), "Restarting service...");
+    SshExecute("sv start llizardgui 2>/dev/null || true");
+
+    // Verify the file is actually deleted
+    bool success = !SshFileExists(plugin->remotePath);
 
     g_opState.complete = true;
     g_opState.success = success;
@@ -308,8 +385,10 @@ bool PluginBrowserUninstall(const char *pluginName) {
     g_opState.operation = OP_NONE;
 
     if (success) {
+        printf("Uninstall: Successfully uninstalled %s\n", pluginName);
         snprintf(g_opState.message, sizeof(g_opState.message), "Uninstalled %s", pluginName);
     } else {
+        printf("Uninstall: Failed to uninstall %s (file may still exist)\n", pluginName);
         snprintf(g_opState.message, sizeof(g_opState.message), "Failed to uninstall %s", pluginName);
     }
 
