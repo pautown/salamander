@@ -55,6 +55,14 @@ static float g_totalContentHeight = 0.0f;
 // Section rectangles for drop detection (in content space, before scroll)
 static Rectangle g_sectionRects[3] = {0};
 
+// Hover state for sidebar
+static SectionType g_hoverSection = SECTION_LOCAL_ONLY;
+static int g_hoverIndex = -1;  // -1 means no hover
+
+// Button rectangles (set by DrawMainPanel, used by HandleInput)
+static Rectangle g_installBtn = {0};
+static Rectangle g_uninstallBtn = {0};
+
 // Font
 static Font g_font;
 static bool g_fontLoaded = false;
@@ -369,7 +377,7 @@ static void DrawSectionHeader(const char *title, float y, Color accentColor, boo
     DrawTextEx(g_font, title, (Vector2){SIDEBAR_PADDING, y}, 14, 1, accentColor);
 }
 
-static void DrawPluginItem(const PluginInfo *p, float y, bool selected, bool isDragSource, Color accentColor) {
+static void DrawPluginItem(const PluginInfo *p, float y, bool selected, bool hovered, bool isDragSource, Color accentColor) {
     Rectangle itemRect = {SIDEBAR_PADDING - 4, y, SIDEBAR_WIDTH - SIDEBAR_PADDING * 2 + 8, SIDEBAR_ITEM_HEIGHT};
 
     float alpha = isDragSource ? 0.3f : 1.0f;
@@ -377,9 +385,12 @@ static void DrawPluginItem(const PluginInfo *p, float y, bool selected, bool isD
     if (selected && !isDragSource) {
         DrawRectangleRounded(itemRect, 0.2f, 4, COLOR_CARD_SELECTED);
         DrawRectangle((int)itemRect.x, (int)itemRect.y + 6, 3, (int)itemRect.height - 12, accentColor);
+    } else if (hovered && !isDragSource) {
+        // Hover state - subtle highlight
+        DrawRectangleRounded(itemRect, 0.2f, 4, COLOR_CARD_HOVER);
     }
 
-    Color textColor = selected ? COLOR_TEXT_BRIGHT : COLOR_TEXT_WARM;
+    Color textColor = selected ? COLOR_TEXT_BRIGHT : (hovered ? COLOR_TEXT_BRIGHT : COLOR_TEXT_WARM);
     textColor = ColorWithAlpha(textColor, alpha);
 
     DrawTextEx(g_font, p->displayName, (Vector2){SIDEBAR_PADDING + 8, y + 10.0f}, 16, 1, textColor);
@@ -398,6 +409,9 @@ static void DrawSidebar(const PluginList *plugins, float deltaTime) {
 
     Vector2 mouse = GetMousePosition();
     bool mouseInSidebar = (mouse.x < SIDEBAR_WIDTH && mouse.y > HEADER_HEIGHT && mouse.y < WINDOW_HEIGHT - FOOTER_HEIGHT);
+
+    // Reset hover state
+    g_hoverIndex = -1;
 
     // Begin scissor mode for scrolling content
     BeginScissorMode(0, SIDEBAR_CONTENT_TOP, SIDEBAR_WIDTH, SIDEBAR_CONTENT_HEIGHT);
@@ -437,7 +451,20 @@ static void DrawSidebar(const PluginList *plugins, float deltaTime) {
             if (p->remotePath[0] != '\0' && p->localPath[0] == '\0') {
                 bool selected = (g_selection.section == SECTION_DEVICE_ONLY && g_selection.index == idx);
                 bool isDragSource = g_drag.isDragging && strcmp(g_drag.pluginName, p->name) == 0;
-                DrawPluginItem(p, y, selected, isDragSource, COLOR_INSTALLING);
+
+                // Check hover
+                bool hovered = false;
+                if (mouseInSidebar && !g_drag.isDragging) {
+                    float itemTop = contentY;
+                    float itemBottom = contentY + SIDEBAR_ITEM_HEIGHT;
+                    if (adjustedMouseY >= itemTop && adjustedMouseY < itemBottom) {
+                        g_hoverSection = SECTION_DEVICE_ONLY;
+                        g_hoverIndex = idx;
+                        hovered = true;
+                    }
+                }
+
+                DrawPluginItem(p, y, selected, hovered, isDragSource, COLOR_INSTALLING);
                 y += SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING;
                 contentY += SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING;
                 idx++;
@@ -473,7 +500,20 @@ static void DrawSidebar(const PluginList *plugins, float deltaTime) {
             if (p->remotePath[0] != '\0' && p->localPath[0] != '\0') {
                 bool selected = (g_selection.section == SECTION_SYNCED && g_selection.index == idx);
                 bool isDragSource = g_drag.isDragging && strcmp(g_drag.pluginName, p->name) == 0;
-                DrawPluginItem(p, y, selected, isDragSource, COLOR_CONNECTED);
+
+                // Check hover
+                bool hovered = false;
+                if (mouseInSidebar && !g_drag.isDragging) {
+                    float itemTop = contentY;
+                    float itemBottom = contentY + SIDEBAR_ITEM_HEIGHT;
+                    if (adjustedMouseY >= itemTop && adjustedMouseY < itemBottom) {
+                        g_hoverSection = SECTION_SYNCED;
+                        g_hoverIndex = idx;
+                        hovered = true;
+                    }
+                }
+
+                DrawPluginItem(p, y, selected, hovered, isDragSource, COLOR_CONNECTED);
                 y += SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING;
                 contentY += SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING;
                 idx++;
@@ -509,7 +549,20 @@ static void DrawSidebar(const PluginList *plugins, float deltaTime) {
             if (p->localPath[0] != '\0' && p->remotePath[0] == '\0') {
                 bool selected = (g_selection.section == SECTION_LOCAL_ONLY && g_selection.index == idx);
                 bool isDragSource = g_drag.isDragging && strcmp(g_drag.pluginName, p->name) == 0;
-                DrawPluginItem(p, y, selected, isDragSource, COLOR_EMBER);
+
+                // Check hover
+                bool hovered = false;
+                if (mouseInSidebar && !g_drag.isDragging) {
+                    float itemTop = contentY;
+                    float itemBottom = contentY + SIDEBAR_ITEM_HEIGHT;
+                    if (adjustedMouseY >= itemTop && adjustedMouseY < itemBottom) {
+                        g_hoverSection = SECTION_LOCAL_ONLY;
+                        g_hoverIndex = idx;
+                        hovered = true;
+                    }
+                }
+
+                DrawPluginItem(p, y, selected, hovered, isDragSource, COLOR_EMBER);
                 y += SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING;
                 contentY += SIDEBAR_ITEM_HEIGHT + SIDEBAR_ITEM_SPACING;
                 idx++;
@@ -682,25 +735,48 @@ static void DrawMainPanel(const PluginInfo *plugin) {
     bool canUninstall = (plugin->remotePath[0] != '\0' && SshGetStatus() == SSH_STATUS_CONNECTED);
     bool isBusy = PluginBrowserIsBusy();
 
-    Rectangle installBtn = {panelX + PANEL_PADDING, (float)y, BUTTON_WIDTH, BUTTON_HEIGHT};
-    Rectangle uninstallBtn = {panelX + PANEL_PADDING + BUTTON_WIDTH + BUTTON_SPACING, (float)y, BUTTON_WIDTH, BUTTON_HEIGHT};
+    // Store button positions for click detection
+    g_installBtn = (Rectangle){panelX + PANEL_PADDING, (float)y, BUTTON_WIDTH, BUTTON_HEIGHT};
+    g_uninstallBtn = (Rectangle){panelX + PANEL_PADDING + BUTTON_WIDTH + BUTTON_SPACING, (float)y, BUTTON_WIDTH, BUTTON_HEIGHT};
 
-    Color installBg = (canInstall && !isBusy) ? COLOR_FIRE_DEEP : ColorWithAlpha(COLOR_FIRE_DEEP, 0.3f);
+    Vector2 mouse = GetMousePosition();
+    bool installHovered = CheckCollisionPointRec(mouse, g_installBtn) && canInstall && !isBusy;
+    bool uninstallHovered = CheckCollisionPointRec(mouse, g_uninstallBtn) && canUninstall && !isBusy;
+
+    // Install button
+    Color installBg;
+    if (canInstall && !isBusy) {
+        installBg = installHovered ? COLOR_FLAME_ORANGE : COLOR_FIRE_DEEP;
+    } else {
+        installBg = ColorWithAlpha(COLOR_FIRE_DEEP, 0.3f);
+    }
     Color installText = (canInstall && !isBusy) ? COLOR_TEXT_BRIGHT : COLOR_TEXT_DIM;
-    DrawRectangleRounded(installBtn, BUTTON_RADIUS, 4, installBg);
+    DrawRectangleRounded(g_installBtn, BUTTON_RADIUS, 4, installBg);
+    if (installHovered) {
+        DrawRectangleRoundedLines(g_installBtn, BUTTON_RADIUS, 4, ColorWithAlpha(COLOR_GOLD, 0.8f));
+    }
     Vector2 installSize = MeasureTextEx(g_font, "INSTALL", 16, 1);
     DrawTextEx(g_font, "INSTALL",
-               (Vector2){installBtn.x + (installBtn.width - installSize.x) / 2,
-                         installBtn.y + (installBtn.height - 16) / 2},
+               (Vector2){g_installBtn.x + (g_installBtn.width - installSize.x) / 2,
+                         g_installBtn.y + (g_installBtn.height - 16) / 2},
                16, 1, installText);
 
-    Color uninstallBg = (canUninstall && !isBusy) ? COLOR_ASH : ColorWithAlpha(COLOR_ASH, 0.3f);
+    // Uninstall button
+    Color uninstallBg;
+    if (canUninstall && !isBusy) {
+        uninstallBg = uninstallHovered ? ColorWithAlpha(COLOR_ASH, 1.2f) : COLOR_ASH;
+    } else {
+        uninstallBg = ColorWithAlpha(COLOR_ASH, 0.3f);
+    }
     Color uninstallText = (canUninstall && !isBusy) ? COLOR_TEXT_WARM : COLOR_TEXT_DIM;
-    DrawRectangleRounded(uninstallBtn, BUTTON_RADIUS, 4, uninstallBg);
+    DrawRectangleRounded(g_uninstallBtn, BUTTON_RADIUS, 4, uninstallBg);
+    if (uninstallHovered) {
+        DrawRectangleRoundedLines(g_uninstallBtn, BUTTON_RADIUS, 4, ColorWithAlpha(COLOR_DISCONNECTED, 0.8f));
+    }
     Vector2 uninstallSize = MeasureTextEx(g_font, "UNINSTALL", 16, 1);
     DrawTextEx(g_font, "UNINSTALL",
-               (Vector2){uninstallBtn.x + (uninstallBtn.width - uninstallSize.x) / 2,
-                         uninstallBtn.y + (uninstallBtn.height - 16) / 2},
+               (Vector2){g_uninstallBtn.x + (g_uninstallBtn.width - uninstallSize.x) / 2,
+                         g_uninstallBtn.y + (g_uninstallBtn.height - 16) / 2},
                16, 1, uninstallText);
 
     y += BUTTON_HEIGHT + 30;
@@ -849,22 +925,18 @@ static void HandleInput(const PluginList *plugins) {
         }
     }
 
-    // Mouse click on main panel buttons
+    // Mouse click on main panel buttons (use stored button rectangles from DrawMainPanel)
     if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && selectedPlugin && !isBusy && mouse.x >= PANEL_START_X) {
-        int panelX = PANEL_START_X;
-        int buttonY = HEADER_HEIGHT + PANEL_PADDING + 48 + 20 + 30 + 24 + 24 + 10 + 50;
-
-        Rectangle installBtn = {panelX + PANEL_PADDING, (float)buttonY, BUTTON_WIDTH, BUTTON_HEIGHT};
-        Rectangle uninstallBtn = {panelX + PANEL_PADDING + BUTTON_WIDTH + BUTTON_SPACING, (float)buttonY, BUTTON_WIDTH, BUTTON_HEIGHT};
-
-        if (CheckCollisionPointRec(mouse, installBtn)) {
+        if (CheckCollisionPointRec(mouse, g_installBtn)) {
             if (selectedPlugin->localPath[0] != '\0' && selectedPlugin->remotePath[0] == '\0' &&
                 SshGetStatus() == SSH_STATUS_CONNECTED) {
+                printf("Salamander: Installing %s (button click)\n", selectedPlugin->name);
                 PluginBrowserInstall(selectedPlugin->name);
                 g_needsRefresh = true;
             }
-        } else if (CheckCollisionPointRec(mouse, uninstallBtn)) {
+        } else if (CheckCollisionPointRec(mouse, g_uninstallBtn)) {
             if (selectedPlugin->remotePath[0] != '\0' && SshGetStatus() == SSH_STATUS_CONNECTED) {
+                printf("Salamander: Uninstalling %s (button click)\n", selectedPlugin->name);
                 PluginBrowserUninstall(selectedPlugin->name);
                 g_needsRefresh = true;
             }
